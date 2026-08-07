@@ -54,6 +54,11 @@ def calculate_score(company: Company, signals: list[Signal]) -> tuple[int, list[
         score += pts
         reasons.append(f"Recent funding: +{pts}")
 
+    if "NEWS" in signal_types:
+        pts = ICP_SCORING_RULES.get("company_news", 15)
+        score += pts
+        reasons.append(f"Company news signal: +{pts}")
+
     # ── Industry scoring ───────────────────────────────────
     industry = (company.industry or "").lower()
     if "health" in industry:
@@ -64,6 +69,10 @@ def calculate_score(company: Company, signals: list[Signal]) -> tuple[int, list[
         pts = ICP_SCORING_RULES.get("fintech", 15)
         score += pts
         reasons.append(f"FinTech: +{pts}")
+    elif any(kw in industry for kw in ("ai", "artificial intelligence", "tech", "software", "internet", "social media", "dating", "automotive")):
+        pts = ICP_SCORING_RULES.get("tech_ai", 20)
+        score += pts
+        reasons.append(f"Tech/AI/Software industry: +{pts}")
 
     # ── Geography scoring ──────────────────────────────────
     country = (company.country or "").upper()

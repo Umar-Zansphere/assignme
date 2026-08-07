@@ -24,7 +24,7 @@ class OpenRouterError(Exception):
     pass
 
 
-@retry(max_attempts=OPENROUTER_MAX_RETRIES, base_delay=2.0)
+@retry(max_attempts=5, base_delay=5.0)
 def _raw_chat(messages: list[dict], model: str) -> str:
     """Send chat completion request and return raw content string."""
     if not OPENROUTER_API_KEY:

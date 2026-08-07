@@ -43,11 +43,17 @@ def run(dry_run: bool = False):
 
     with get_session() as session:
         companies = session.query(Company).filter_by(status="QUALIFIED").all()
+        company_ids = [c.id for c in companies]
         log.info(f"Found {len(companies)} companies to find contacts for")
 
-        found = 0
+    found = 0
 
-        for company in companies:
+    for cid in company_ids:
+        with get_session() as session:
+            company = session.query(Company).filter_by(id=cid).first()
+            if not company:
+                continue
+
             log.info(f"Finding contacts for: {company.name}")
 
             if dry_run:
@@ -86,8 +92,11 @@ def run(dry_run: bool = False):
 
                     # Guess email
                     domain = extract_domain(company.website or "")
-                    first_name = data.get("first_name", "").strip()
-                    last_name = data.get("last_name", "").strip()
+                    if not domain or any(d in domain for d in ("techcrunch.com", "producthunt.com", "ycombinator.com", "news", "reuters.com", "bloomberg.com")):
+                        domain = f"{company.name.lower().replace(' ', '')}.com"
+
+                    first_name = data.get("first_name", "").strip() or (name.split()[0] if name else "")
+                    last_name = data.get("last_name", "").strip() or (name.split()[-1] if len(name.split()) > 1 else "")
                     email_guesses = guess_email(first_name, last_name, domain) if domain else []
 
                     # Check for duplicate contact
@@ -103,7 +112,7 @@ def run(dry_run: bool = False):
                         company_id=company.id,
                         name=name,
                         role=data.get("role", role),
-                        email=email_guesses[0] if email_guesses else "",
+                        email=email_guesses[0] if email_guesses else f"{first_name.lower()}@{domain}",
                         linkedin_url=data.get("linkedin_url", ""),
                     )
                     session.add(contact)
@@ -122,7 +131,7 @@ def run(dry_run: bool = False):
             except Exception as e:
                 log.error(f"  [FAIL] Failed for {company.name}: {e}")
 
-        log.info(f"Found contacts for {found} companies")
+    log.info(f"Found contacts for {found} companies")
 
 
 if __name__ == "__main__":

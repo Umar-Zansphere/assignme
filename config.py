@@ -35,7 +35,13 @@ IMAP_USERNAME: str = os.getenv("IMAP_USERNAME", "")
 IMAP_PASSWORD: str = os.getenv("IMAP_PASSWORD", "")
 
 # ── Database ───────────────────────────────────────────────
-DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///sales_machine.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///sales_machine.db")
+if raw_db_url.startswith("sqlite:///") and not os.path.isabs(raw_db_url.replace("sqlite:///", "")):
+    db_filename = raw_db_url.replace("sqlite:///", "")
+    DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, db_filename).replace(os.sep, '/')}"
+else:
+    DATABASE_URL = raw_db_url
 
 # ── ICP Scoring ────────────────────────────────────────────
 ICP_SCORE_THRESHOLD: int = int(os.getenv("ICP_SCORE_THRESHOLD", "40"))
@@ -43,6 +49,7 @@ ICP_SCORE_THRESHOLD: int = int(os.getenv("ICP_SCORE_THRESHOLD", "40"))
 # Scoring weights (rule → points)
 ICP_SCORING_RULES: dict[str, int] = {
     "hiring_engineers": 30,
+    "tech_ai": 20,
     "healthtech": 20,
     "fintech": 15,
     "usa": 10,
@@ -51,6 +58,7 @@ ICP_SCORING_RULES: dict[str, int] = {
     "employee_200_1000": 10,
     "product_launch": 15,
     "recent_funding": 25,
+    "company_news": 15,
 }
 
 # ── Email Sending ──────────────────────────────────────────

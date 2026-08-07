@@ -62,86 +62,107 @@ def run(dry_run: bool = False):
 
     with get_session() as session:
         companies = session.query(Company).filter_by(status="RESEARCH_DONE").all()
+        company_ids = [c.id for c in companies]
         log.info(f"Found {len(companies)} companies to write emails for")
 
-        written = 0
+    written = 0
 
-        for company in companies:
-            log.info(f"Writing emails for: {company.name}")
-
-            if dry_run:
-                log.info(f"  [DRY RUN] Would generate emails for {company.name}")
+    for cid in company_ids:
+        # Step 1: Read company, contact, research data
+        with get_session() as session:
+            company = session.query(Company).filter_by(id=cid).first()
+            if not company:
                 continue
 
-            try:
-                # Get valid contact
-                contact = (
-                    session.query(Contact)
-                    .filter_by(company_id=company.id, verified="VALID")
-                    .first()
-                )
-                if not contact:
-                    log.warning(f"  No valid contact for {company.name}, skipping")
-                    continue
+            company_name = company.name
+            company_industry = company.industry or "Unknown"
+            company_country = company.country or "Unknown"
+            company_employees = company.employee_count or "Unknown"
 
-                # Get research
-                research = session.query(Research).filter_by(company_id=company.id).first()
-                if not research:
-                    log.warning(f"  No research for {company.name}, skipping")
-                    continue
+            log.info(f"Writing emails for: {company_name}")
 
-                # Parse research data
-                pain_points = safe_json_loads(research.pain_points) or []
-                tech_stack = safe_json_loads(research.tech_stack) or []
+            if dry_run:
+                log.info(f"  [DRY RUN] Would generate emails for {company_name}")
+                continue
 
-                first_name = contact.name.split()[0] if contact.name else "there"
+            contact = (
+                session.query(Contact)
+                .filter_by(company_id=cid, verified="VALID")
+                .first()
+            )
+            if not contact:
+                log.warning(f"  No valid contact for {company_name}, skipping")
+                continue
 
-                user_prompt = f"""Decision Maker:
-- Name: {contact.name}
+            contact_id = contact.id
+            contact_name = contact.name
+            contact_role = contact.role
+
+            research = session.query(Research).filter_by(company_id=cid).first()
+            if not research:
+                log.warning(f"  No research for {company_name}, skipping")
+                continue
+
+            research_summary = research.summary or ""
+            pain_points = safe_json_loads(research.pain_points) or []
+            tech_stack = safe_json_loads(research.tech_stack) or []
+            recent_news = research.recent_news or ""
+
+        # Step 2: Call LLM outside of database transaction
+        try:
+            first_name = contact_name.split()[0] if contact_name else "there"
+
+            user_prompt = f"""Decision Maker:
+- Name: {contact_name}
 - First Name: {first_name}
-- Role: {contact.role}
+- Role: {contact_role}
 
 Company:
-- Name: {company.name}
-- Industry: {company.industry or 'Unknown'}
-- Country: {company.country or 'Unknown'}
-- Employee Count: {company.employee_count or 'Unknown'}
+- Name: {company_name}
+- Industry: {company_industry}
+- Country: {company_country}
+- Employee Count: {company_employees}
 
 Research:
-- Summary: {research.summary or ''}
+- Summary: {research_summary}
 - Pain Points: {', '.join(pain_points[:3]) if pain_points else 'N/A'}
 - Tech Stack: {', '.join(tech_stack[:5]) if tech_stack else 'N/A'}
-- Recent News: {research.recent_news or 'N/A'}
+- Recent News: {recent_news or 'N/A'}
 
-Signal that triggered outreach: {research.recent_news or 'hiring engineers'}
+Signal that triggered outreach: {recent_news or 'hiring engineers'}
 """
 
-                data = call_llm_with_schema(
-                    system_prompt=EMAIL_PROMPT,
-                    user_prompt=user_prompt,
-                    required_keys=["subject", "body", "followup_1_body", "followup_2_body"],
-                )
+            data = call_llm_with_schema(
+                system_prompt=EMAIL_PROMPT,
+                user_prompt=user_prompt,
+                required_keys=["subject", "body", "followup_1_body", "followup_2_body"],
+            )
 
+            # Step 3: Write emails and update company status in a fast isolated transaction
+            with get_session() as session:
                 campaign = _get_or_create_campaign(session)
                 now = utcnow()
 
-                # Create email sequence
+                subj = data["subject"]
+                f1_subj = data.get("followup_1_subject") or f"Re: {subj}"
+                f2_subj = data.get("followup_2_subject") or f"Re: {subj}"
+
                 emails_to_create = [
                     {
                         "sequence_number": 0,
-                        "subject": data["subject"],
+                        "subject": subj,
                         "body": data["body"],
                         "scheduled_at": now,  # Send immediately
                     },
                     {
                         "sequence_number": 1,
-                        "subject": data.get("followup_1_subject", f"Re: {data['subject']}"),
+                        "subject": f1_subj,
                         "body": data["followup_1_body"],
                         "scheduled_at": now + timedelta(days=FOLLOWUP_1_DELAY_DAYS),
                     },
                     {
                         "sequence_number": 2,
-                        "subject": data.get("followup_2_subject", f"Re: {data['subject']}"),
+                        "subject": f2_subj,
                         "body": data["followup_2_body"],
                         "scheduled_at": now + timedelta(days=FOLLOWUP_2_DELAY_DAYS),
                     },
@@ -149,8 +170,8 @@ Signal that triggered outreach: {research.recent_news or 'hiring engineers'}
 
                 for email_data in emails_to_create:
                     email = Email(
-                        company_id=company.id,
-                        contact_id=contact.id,
+                        company_id=cid,
+                        contact_id=contact_id,
                         campaign_id=campaign.id,
                         sequence_number=email_data["sequence_number"],
                         subject=email_data["subject"],
@@ -160,16 +181,18 @@ Signal that triggered outreach: {research.recent_news or 'hiring engineers'}
                     )
                     session.add(email)
 
-                company.status = "EMAIL_READY"
-                company.updated_at = utcnow()
-                written += 1
+                comp = session.query(Company).filter_by(id=cid).first()
+                if comp:
+                    comp.status = "EMAIL_READY"
+                    comp.updated_at = utcnow()
 
+                written += 1
                 log.info(f"  [OK] Generated 3 emails (subject: {data['subject'][:50]}...)")
 
-            except Exception as e:
-                log.error(f"  [FAIL] Email writing failed for {company.name}: {e}")
+        except Exception as e:
+            log.error(f"  [FAIL] Email writing failed for {company_name}: {e}")
 
-        log.info(f"Generated emails for {written} companies")
+    log.info(f"Generated emails for {written} companies")
 
 
 if __name__ == "__main__":

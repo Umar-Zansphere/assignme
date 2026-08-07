@@ -10,6 +10,8 @@ Usage:
 """
 
 import time
+import re
+import html
 import httpx
 
 from config import APIFY_API_TOKEN, APIFY_BASE_URL
@@ -210,8 +212,8 @@ def get_product_launches() -> list[dict]:
     """
     try:
         raw_items = run_actor(ACTORS["product_hunt"], {
-            "target": "developer-tools",
-            "maxItems": 50,
+            "target": "daily",
+            "maxItems": 30,
         })
     except Exception as e:
         log.error(f"Failed to scrape Product Hunt: {e}")
@@ -229,6 +231,50 @@ def get_product_launches() -> list[dict]:
         })
 
     return results
+
+def _extract_company_from_title(title: str) -> str:
+    """Extract likely company name from a news headline."""
+    if not title:
+        return ""
+    
+    # Unescape HTML entities (e.g. &#8217;, &amp;)
+    cleaned = html.unescape(title).strip()
+    
+    # Strip common editorial prefixes
+    cleaned = re.sub(r'^(Exclusive|Report|Breaking|Analysis|Watch|Video|Podcast|Interview|Review|Opinion):\s*', '', cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r'^(Defense tech|Fintech|Biotech|Health tech|Crypto|AI startup|Startup)\s+', '', cleaned, flags=re.IGNORECASE).strip()
+
+    # Skip non-company editorial / promo headlines
+    lower = cleaned.lower()
+    if any(lower.startswith(p) for p in ("get up to", "your table", "how to", "why ", "what ", "where ", "here's ", "here is ", "vogue just", "hacker pleads", "gen z ")):
+        return ""
+
+    # Check for "<Company>'s ..."
+    match_possessive = re.match(r"^([A-Z0-9][A-Za-z0-9\.\s&-]+?)['’]s\b", cleaned)
+    if match_possessive:
+        candidate = match_possessive.group(1).strip()
+        if len(candidate) > 1 and candidate.lower() not in ("here", "there", "everyone", "today", "yesterday"):
+            return candidate
+
+    # Check for common headline patterns: "<Company> raises...", "<Company> acquires...", etc.
+    match = re.match(r'^([A-Z0-9][A-Za-z0-9\.\s&-]+?)(?:\s+(?:raises|acquires|launches|partners|hires|secures|unveils|expands|leads|inks|files|debuts|rolls out|says|plans|builds|to\s+|and\s+|lays off|shuts|closes|buys|brings))\b', cleaned)
+    if match:
+        candidate = match.group(1).strip()
+        if len(candidate) > 1 and candidate.lower() not in ("why", "how", "what", "where", "when", "here", "this", "after", "amid", "as", "new", "get", "chatgpt"):
+            return candidate
+
+    # Fallback: take first 1-2 capitalized words if reasonable
+    words = cleaned.split()
+    cap_words = []
+    for w in words[:2]:
+        if w and w[0].isupper() and w.lower() not in ("why", "how", "what", "where", "when", "here", "this", "after", "amid", "as", "exclusive", "report", "breaking", "analysis", "watch", "get", "your"):
+            cap_words.append(w)
+        else:
+            break
+    if cap_words:
+        return " ".join(cap_words)
+
+    return ""
 
 
 def get_company_news(rss_urls: list[str] | None = None) -> list[dict]:
@@ -253,9 +299,18 @@ def get_company_news(rss_urls: list[str] | None = None) -> list[dict]:
 
     results = []
     for item in raw_items:
+        title = item.get("title", "").strip()
+        if not title:
+            continue
+
+        company_name = _extract_company_from_title(title)
+        # Avoid using journalist author as company name
+        if not company_name:
+            continue
+
         results.append({
-            "company": item.get("author") or "Unknown",
-            "title": item.get("title", ""),
+            "company": company_name,
+            "title": title,
             "url": item.get("link") or item.get("url", ""),
             "description": item.get("description") or item.get("summary", ""),
             "source": "rss",
@@ -265,28 +320,65 @@ def get_company_news(rss_urls: list[str] | None = None) -> list[dict]:
     return results
 
 
+def _clean_html_text(raw_html: str, max_chars: int = 5000) -> str:
+    """Strip script, style, navigation tags and return clean plain text."""
+    if not raw_html:
+        return ""
+    
+    # Remove script, style, nav, footer, header, svg, noscript
+    cleaned = re.sub(r'<(script|style|nav|footer|header|svg|noscript|iframe)[^>]*>.*?</\1>', ' ', raw_html, flags=re.DOTALL | re.IGNORECASE)
+    # Remove HTML tags
+    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+    # Unescape HTML entities (&amp;, &quot;, etc.)
+    cleaned = html.unescape(cleaned)
+    # Collapse multiple whitespaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned[:max_chars]
+
+
 def scrape_website(url: str) -> str:
     """
     Scrape a single webpage and return its text content.
 
+    Prioritizes fast direct HTTP fetching, falling back to Jina reader API.
     Used by enrichment.py for extracting company info.
     """
+    if not url:
+        return ""
+
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Step 1: Direct HTTP GET (fast & free)
     try:
-        raw_items = run_actor(ACTORS["web_scraper"], {
-            "startUrls": [{"url": url}],
-            "maxPagesPerCrawl": 1,
-            "pageFunction": """
-                async function pageFunction(context) {
-                    const { page } = context;
-                    const text = await page.evaluate(() => document.body.innerText);
-                    return { url: page.url(), text: text.substring(0, 5000) };
-                }
-            """,
-        })
-        if raw_items:
-            return raw_items[0].get("text", "")
+        with httpx.Client(timeout=10.0, follow_redirects=True, verify=False) as client:
+            resp = client.get(url, headers=headers)
+            if resp.status_code == 200 and resp.text:
+                text = _clean_html_text(resp.text)
+                if len(text) >= 100:
+                    log.info(f"Direct scrape succeeded for {url} ({len(text)} chars)")
+                    return text
     except Exception as e:
-        log.error(f"Failed to scrape {url}: {e}")
+        log.debug(f"Direct scrape failed for {url}: {e}")
+
+    # Step 2: Fallback to Jina Reader API (free, renders JavaScript / handles Cloudflare)
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+            resp = client.get(jina_url, headers={"User-Agent": headers["User-Agent"]})
+            if resp.status_code == 200 and resp.text:
+                text = re.sub(r'\s+', ' ', resp.text).strip()[:5000]
+                if len(text) >= 100:
+                    log.info(f"Jina reader scrape succeeded for {url} ({len(text)} chars)")
+                    return text
+    except Exception as e:
+        log.debug(f"Jina reader scrape failed for {url}: {e}")
 
     return ""
 
@@ -309,11 +401,22 @@ def search_google(query: str, max_results: int = 5) -> list[dict]:
 
     results = []
     for item in raw_items:
-        results.append({
-            "title": item.get("title", ""),
-            "url": item.get("url") or item.get("link", ""),
-            "description": item.get("description") or item.get("snippet", ""),
-        })
+        # Apify google-search-scraper nests results inside 'organicResults'
+        organic = item.get("organicResults", [])
+        if organic and isinstance(organic, list):
+            for org in organic[:max_results]:
+                results.append({
+                    "title": org.get("title", ""),
+                    "url": org.get("url") or org.get("link", ""),
+                    "description": org.get("description") or org.get("snippet", ""),
+                })
+        else:
+            # Fallback for flat items schema
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url") or item.get("link", ""),
+                "description": item.get("description") or item.get("snippet", ""),
+            })
 
     return results
 

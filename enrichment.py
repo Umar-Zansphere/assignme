@@ -49,6 +49,13 @@ def run(dry_run: bool = False):
         for company in companies:
             log.info(f"Enriching: {company.name}")
 
+            # Skip invalid company names
+            if not company.name or company.name.lower() in ("unknown", "n/a", "none", "null", "undefined") or len(company.name) < 2:
+                log.warning(f"  Skipping invalid company name: '{company.name}'")
+                company.status = "REJECTED"
+                company.updated_at = utcnow()
+                continue
+
             if dry_run:
                 log.info(f"  [DRY RUN] Would enrich {company.name}")
                 continue
@@ -60,7 +67,11 @@ def run(dry_run: bool = False):
 
                 if website_url:
                     domain = extract_domain(website_url)
-                    if domain and not domain.startswith(("greenhouse", "lever", "producthunt")):
+                    news_and_board_domains = (
+                        "greenhouse", "lever", "ashby", "producthunt",
+                        "techcrunch", "bloomberg", "reuters", "wsj", "forbes", "medium"
+                    )
+                    if domain and not any(domain.startswith(d) for d in news_and_board_domains):
                         website_text = scrape_website(f"https://{domain}")
 
                 # Use LLM to extract structured data
@@ -88,10 +99,12 @@ def run(dry_run: bool = False):
                 company.github_url = data.get("github_url", "")
                 company.status = "ENRICHED"
                 company.updated_at = utcnow()
+                session.commit()
 
                 log.info(f"  [OK] Enriched: industry={company.industry}, country={company.country}")
 
             except Exception as e:
+                session.rollback()
                 log.error(f"  [FAIL] Failed to enrich {company.name}: {e}")
                 # Don't change status — will retry next run
 

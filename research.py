@@ -41,11 +41,17 @@ def run(dry_run: bool = False):
 
     with get_session() as session:
         companies = session.query(Company).filter_by(status="EMAIL_VERIFIED").all()
+        company_ids = [c.id for c in companies]
         log.info(f"Found {len(companies)} companies to research")
 
-        researched = 0
+    researched = 0
 
-        for company in companies:
+    for cid in company_ids:
+        with get_session() as session:
+            company = session.query(Company).filter_by(id=cid).first()
+            if not company:
+                continue
+
             log.info(f"Researching: {company.name}")
 
             if dry_run:
@@ -107,7 +113,7 @@ Detected signals:
             except Exception as e:
                 log.error(f"  [FAIL] Research failed for {company.name}: {e}")
 
-        log.info(f"Researched {researched} companies")
+    log.info(f"Researched {researched} companies")
 
 
 if __name__ == "__main__":
