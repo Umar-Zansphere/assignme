@@ -31,7 +31,8 @@ class ApifyError(Exception):
 ACTORS = {
     "greenhouse_scraper": "fantastic-jobs/greenhouse-jobs-api",
     "lever_scraper": "bovi/greenhouse-lever-ashby-job-scraper",
-    "linkedin_scraper": "curious_coder/linkedin-jobs-scraper", 
+    "linkedin_scraper": "curious_coder/linkedin-jobs-scraper",
+    "upwork_scraper": "neatrat/upwork-job-scraper",
     "product_hunt": "maximedupre/product-hunt-scraper",
     "rss_reader": "automation-lab/rss-feed-reader",
     "web_scraper": "apify/web-scraper",
@@ -76,6 +77,12 @@ def run_actor(actor_id: str, input_data: dict, timeout_secs: int = 300) -> list[
             headers=headers,
             json=input_data,
         )
+        if not resp.is_success:
+            try:
+                error_detail = resp.json()
+            except Exception:
+                error_detail = resp.text
+            log.error(f"Apify actor start failed [{resp.status_code}]: {error_detail}")
         resp.raise_for_status()
         run_data = resp.json()["data"]
         run_id = run_data["id"]
@@ -201,6 +208,85 @@ def get_linkedin_job_postings(
 
     log.info(f"LinkedIn returned {len(results)} job postings")
     return results
+
+
+# Default Upwork search queries — targets companies posting QA/testing/automation work
+UPWORK_SEARCH_QUERIES = [
+    "QA engineer",
+    "software test automation",
+    "SDET selenium pytest",
+    "quality assurance testing",
+]
+
+
+def get_upwork_job_postings(
+    search_queries: list[str] | None = None,
+    max_results: int = 50,
+) -> list[dict]:
+    """
+    Scrape Upwork for job postings using neatrat/upwork-job-scraper.
+
+    Args:
+        search_queries: List of search keyword strings.
+        max_results: Max jobs to return per query.
+
+    Returns normalized list:
+        [{"company": str, "title": str, "url": str, "source": str,
+          "description": str, "signal_type": str}, ...]
+    """
+    queries = search_queries or UPWORK_SEARCH_QUERIES
+    all_results = []
+
+    for query in queries:
+        try:
+            raw_items = run_actor(ACTORS["upwork_scraper"], {
+                "query": query,
+                "perPage": min(max_results, 50),
+                "pagesToScrape": 1,
+            })
+        except Exception as e:
+            log.error(f"Failed to scrape Upwork for query '{query}': {e}")
+            continue
+
+        seen_urls: set[str] = set()
+        for item in raw_items:
+            # Upwork actor returns clientInfo dict or various company fields
+            client_info = item.get("clientInfo")
+            company_name = (
+                (client_info.get("companyName", "") if isinstance(client_info, dict) else "")
+                or item.get("company", "")
+                or item.get("clientName", "")
+                or ""
+            ).strip()
+
+            # Fall back to a cleaned-up title when no company name is available
+            if not company_name:
+                title_raw = item.get("title", "") or item.get("jobTitle", "") or ""
+                company_name = title_raw[:60].strip() or "Unknown"
+
+            job_url = (
+                item.get("url")
+                or item.get("jobUrl")
+                or item.get("link")
+                or ""
+            ).strip()
+
+            if not job_url or job_url in seen_urls:
+                continue
+            seen_urls.add(job_url)
+
+            all_results.append({
+                "company": company_name,
+                "title": item.get("title") or item.get("jobTitle", "") or "",
+                "url": job_url,
+                "description": (item.get("description") or item.get("snippet") or "")[:500],
+                "source": "upwork",
+                "signal_type": "JOB_POSTING",
+            })
+
+
+    log.info(f"Upwork returned {len(all_results)} job postings")
+    return all_results
 
 
 def get_product_launches() -> list[dict]:

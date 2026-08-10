@@ -52,6 +52,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+SOURCE_COLORS = {
+    "upwork":      "#14a800",
+    "linkedin":    "#0a66c2",
+    "greenhouse":  "#3bba4c",
+    "lever":       "#5db7de",
+    "producthunt": "#da552f",
+    "rss":         "#f59e0b",
+    "unknown":     "#718096",
+}
 
 # ── Data Loading ───────────────────────────────────────────
 @st.cache_data(ttl=30)  # Refresh every 30 seconds
@@ -72,6 +81,7 @@ def load_stats() -> dict:
         stats["emails_sent"] = session.query(Email).filter_by(status="SENT").count()
         stats["emails_scheduled"] = session.query(Email).filter_by(status="SCHEDULED").count()
         stats["replies"] = session.query(ReplyLog).count()
+        stats["new_signal"] = session.query(Company).filter_by(status="NEW_SIGNAL").count()
 
         # Reply rate
         if stats["emails_sent"] > 0:
@@ -86,6 +96,20 @@ def load_stats() -> dict:
             )
         else:
             stats["reply_rate"] = 0
+
+        # Signal source breakdown
+        source_rows = session.execute(
+            text("SELECT source, COUNT(*) as cnt FROM signals GROUP BY source ORDER BY cnt DESC")
+        ).fetchall()
+        stats["signal_sources"] = {row[0] or "unknown": row[1] for row in source_rows}
+
+        # Signal type breakdown
+        type_rows = session.execute(
+            text("SELECT signal_type, COUNT(*) as cnt FROM signals GROUP BY signal_type ORDER BY cnt DESC")
+        ).fetchall()
+        stats["signal_types"] = {row[0] or "UNKNOWN": row[1] for row in type_rows}
+
+        stats["upwork_signals"] = session.query(Signal).filter_by(source="upwork").count()
 
     return stats
 
@@ -120,9 +144,35 @@ def load_companies() -> pd.DataFrame:
             "Employees": c.employee_count or 0,
             "ICP Score": c.icp_score,
             "Status": c.status,
+            "Website": c.website or "",
+            "LinkedIn": c.linkedin_url or "",
+            "GitHub": c.github_url or "",
             "Created": c.created_at,
             "Updated": c.updated_at,
         } for c in companies]
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def load_signals() -> pd.DataFrame:
+    """Load all signals as a DataFrame."""
+    init_db()
+    with get_session() as session:
+        signals = (
+            session.query(Signal, Company.name.label("company_name"))
+            .join(Company, Signal.company_id == Company.id)
+            .order_by(Signal.detected_at.desc())
+            .limit(500)
+            .all()
+        )
+        data = [{
+            "Company": s.company_name,
+            "Type": s.Signal.signal_type,
+            "Source": s.Signal.source or "",
+            "Title": s.Signal.title or "",
+            "URL": s.Signal.raw_url or "",
+            "Detected": s.Signal.detected_at,
+        } for s in signals]
     return pd.DataFrame(data) if data else pd.DataFrame()
 
 
@@ -175,10 +225,24 @@ def load_replies() -> pd.DataFrame:
 
 # ── Sidebar ────────────────────────────────────────────────
 st.sidebar.title("🚀 Sales Machine")
+st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "Navigate",
-    ["📊 Overview", "🏢 Companies", "📧 Emails", "💬 Replies", "⚙️ Settings"],
+    ["📊 Overview", "📡 Signals", "🏢 Companies", "📧 Emails", "💬 Replies", "⚙️ Settings"],
 )
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Signal Sources")
+for source, color in SOURCE_COLORS.items():
+    st.sidebar.markdown(
+        f'<span style="color:{color}; font-size:0.8rem;">● {source.capitalize()}</span>',
+        unsafe_allow_html=True
+    )
 
 
 # ── Pages ──────────────────────────────────────────────────
@@ -188,33 +252,121 @@ if page == "📊 Overview":
 
     stats = load_stats()
 
-    # KPI Cards
+    # KPI Row 1
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("📡 Signals", stats["total_signals"])
-    col2.metric("✅ Qualified", stats["qualified"])
-    col3.metric("📧 Sent", stats["emails_sent"])
+    col1.metric("📡 Total Signals", stats["total_signals"])
+    col2.metric("🆕 Unprocessed", stats["new_signal"])
+    col3.metric("✅ Qualified", stats["qualified"])
+    col4.metric("❌ Rejected", stats["rejected"])
+    col5.metric("🏢 Companies", stats["total_companies"])
+
+    st.divider()
+
+    # KPI Row 2
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("👤 Valid Contacts", stats["contacts"])
+    col2.metric("📧 Emails Sent", stats["emails_sent"])
+    col3.metric("📅 Scheduled", stats["emails_scheduled"])
     col4.metric("💬 Replies", stats["replies"])
     col5.metric("📈 Reply Rate", f"{stats['reply_rate']}%")
 
     st.divider()
 
-    # Pipeline funnel
-    st.subheader("Pipeline Funnel")
-    pipeline = load_pipeline_counts()
+    col_left, col_right = st.columns([3, 2])
 
-    # Show as a horizontal bar chart
-    funnel_data = pd.DataFrame({
-        "Stage": list(pipeline.keys()),
-        "Count": list(pipeline.values()),
-    })
-    st.bar_chart(funnel_data.set_index("Stage"))
+    with col_left:
+        st.subheader("Pipeline Funnel")
+        pipeline = load_pipeline_counts()
+        non_zero = {k: v for k, v in pipeline.items() if v > 0}
+        if non_zero:
+            funnel_data = pd.DataFrame({
+                "Stage": list(non_zero.keys()),
+                "Count": list(non_zero.values()),
+            })
+            st.bar_chart(funnel_data.set_index("Stage"))
+        else:
+            st.info("No companies in pipeline yet.")
 
-    # Summary stats
+    with col_right:
+        st.subheader("📡 Signal Sources")
+        sources = stats.get("signal_sources", {})
+        if sources:
+            src_df = pd.DataFrame({
+                "Source": list(sources.keys()),
+                "Signals": list(sources.values()),
+            })
+            st.dataframe(src_df, use_container_width=True, hide_index=True)
+            if stats["upwork_signals"] > 0:
+                st.success(f"🟢 Upwork: **{stats['upwork_signals']}** signals collected")
+            else:
+                st.warning("⚠️ No Upwork signals yet — run the watcher")
+        else:
+            st.info("No signals yet.")
+
     st.divider()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("🏢 Total Companies", stats["total_companies"])
-    col2.metric("👤 Valid Contacts", stats["contacts"])
-    col3.metric("📅 Scheduled Emails", stats["emails_scheduled"])
+
+    st.subheader("Signal Type Breakdown")
+    types = stats.get("signal_types", {})
+    if types:
+        type_df = pd.DataFrame({
+            "Signal Type": list(types.keys()),
+            "Count": list(types.values()),
+        })
+        st.bar_chart(type_df.set_index("Signal Type"))
+    else:
+        st.info("No signals recorded yet.")
+
+
+elif page == "📡 Signals":
+    st.title("Signal Explorer")
+    st.caption("All raw signals collected by the watcher (latest 500).")
+
+    df = load_signals()
+    if df.empty:
+        st.info("No signals found yet. Run `python watcher.py` to collect signals.")
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            source_filter = st.multiselect(
+                "Filter by Source",
+                options=sorted(df["Source"].unique().tolist()),
+                default=sorted(df["Source"].unique().tolist()),
+            )
+        with col2:
+            type_filter = st.multiselect(
+                "Filter by Type",
+                options=sorted(df["Type"].unique().tolist()),
+                default=sorted(df["Type"].unique().tolist()),
+            )
+
+        filtered = df[
+            df["Source"].isin(source_filter) &
+            df["Type"].isin(type_filter)
+        ]
+
+        source_counts = filtered["Source"].value_counts()
+        pills = " ".join(
+            f'<span style="background:{SOURCE_COLORS.get(s,"#718096")};color:#fff;'
+            f'padding:2px 10px;border-radius:12px;font-size:0.75rem;margin:2px;">'
+            f'{s}: {c}</span>'
+            for s, c in source_counts.items()
+        )
+        st.markdown(pills, unsafe_allow_html=True)
+        st.markdown("")
+
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+        st.caption(f"Showing {len(filtered)} of {len(df)} signals")
+
+        upwork_df = filtered[filtered["Source"] == "upwork"]
+        if not upwork_df.empty:
+            st.divider()
+            st.subheader(f"🟢 Upwork Signals ({len(upwork_df)})")
+            with st.expander("View Upwork job listings", expanded=False):
+                for _, row in upwork_df.iterrows():
+                    st.markdown(f"**{row['Company']}** — {row['Title']}")
+                    if row["URL"]:
+                        st.markdown(f"🔗 [{row['URL']}]({row['URL']})")
+                    st.markdown("---")
 
 
 elif page == "🏢 Companies":
@@ -247,6 +399,12 @@ elif page == "🏢 Companies":
         if country_filter:
             filtered = filtered[filtered["Country"].isin(country_filter)]
 
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Shown", len(filtered))
+        col2.metric("Avg ICP Score", round(filtered["ICP Score"].mean(), 1) if not filtered.empty else 0)
+        col3.metric("Countries", filtered["Country"].nunique())
+        col4.metric("Industries", filtered["Industry"].nunique())
+
         st.dataframe(filtered, use_container_width=True, hide_index=True)
         st.caption(f"Showing {len(filtered)} of {len(df)} companies")
 
@@ -268,10 +426,11 @@ elif page == "📧 Emails":
         st.dataframe(filtered, use_container_width=True, hide_index=True)
 
         # Stats
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Sent", len(df[df["Status"] == "SENT"]))
         col2.metric("Scheduled", len(df[df["Status"] == "SCHEDULED"]))
         col3.metric("Failed", len(df[df["Status"] == "FAILED"]))
+        col4.metric("Drafts", len(df[df["Status"] == "DRAFT"]))
 
 
 elif page == "💬 Replies":
@@ -310,17 +469,29 @@ elif page == "⚙️ Settings":
     st.dataframe(rules_df, use_container_width=True, hide_index=True)
 
     st.divider()
+    st.subheader("🔗 Signal Sources Configured")
+    sources_table = [
+        {"Source": "Greenhouse", "Type": "Job Board", "Signal": "JOB_POSTING", "Status": "✅ Active"},
+        {"Source": "Lever", "Type": "Job Board", "Signal": "JOB_POSTING", "Status": "✅ Active"},
+        {"Source": "LinkedIn", "Type": "Job Search", "Signal": "JOB_POSTING", "Status": "✅ Active"},
+        {"Source": "Upwork", "Type": "Freelance Job Board", "Signal": "JOB_POSTING", "Status": "✅ Active"},
+        {"Source": "Product Hunt", "Type": "Product Launches", "Signal": "PRODUCT_LAUNCH", "Status": "✅ Active"},
+        {"Source": "RSS (TechCrunch)", "Type": "News Feed", "Signal": "NEWS", "Status": "✅ Active"},
+    ]
+    st.dataframe(pd.DataFrame(sources_table), use_container_width=True, hide_index=True)
+
+    st.divider()
     st.subheader("Pipeline Schedule")
     schedule_data = [
-        {"Module": "watcher", "Interval": "Every 6 hours"},
-        {"Module": "enrichment", "Interval": "Every 2 hours"},
-        {"Module": "scorer", "Interval": "Every 2 hours"},
-        {"Module": "finder", "Interval": "Every 4 hours"},
-        {"Module": "verifier", "Interval": "Every 4 hours"},
-        {"Module": "research", "Interval": "Every 4 hours"},
-        {"Module": "email_writer", "Interval": "Every 4 hours"},
-        {"Module": "sender", "Interval": "Every 1 hour"},
-        {"Module": "reply_checker", "Interval": "Every 30 minutes"},
+        {"Module": "watcher", "Interval": "Every 6 hours", "Description": "Collects signals from all sources incl. Upwork"},
+        {"Module": "enrichment", "Interval": "Every 2 hours", "Description": "Enriches company data via LLM"},
+        {"Module": "scorer", "Interval": "Every 2 hours", "Description": "ICP scoring & qualification"},
+        {"Module": "finder", "Interval": "Every 4 hours", "Description": "Finds decision maker contacts"},
+        {"Module": "verifier", "Interval": "Every 4 hours", "Description": "Verifies email addresses"},
+        {"Module": "research", "Interval": "Every 4 hours", "Description": "Deep company research via LLM"},
+        {"Module": "email_writer", "Interval": "Every 4 hours", "Description": "Generates personalised emails"},
+        {"Module": "sender", "Interval": "Every 1 hour", "Description": "Sends scheduled emails"},
+        {"Module": "reply_checker", "Interval": "Every 30 min", "Description": "Checks inbox for replies"},
     ]
     st.dataframe(pd.DataFrame(schedule_data), use_container_width=True, hide_index=True)
 
