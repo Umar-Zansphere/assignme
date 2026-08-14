@@ -66,7 +66,6 @@ def run_module(module_name: str):
 SCHEDULE = [
     # (module_name, trigger_kwargs)
     ("watcher",        {"hours": 6}),       # Every 6 hours
-    ("enrichment",     {"hours": 2}),       # Every 2 hours
     ("scorer",         {"hours": 2}),       # Every 2 hours
     ("finder",         {"hours": 4}),       # Every 4 hours
     ("verifier",       {"hours": 4}),       # Every 4 hours
@@ -82,7 +81,6 @@ def run_all_once():
     log.info("Running all modules once...")
     pipeline_order = [
         "watcher",
-        "enrichment",
         "scorer",
         "finder",
         "verifier",

@@ -10,7 +10,7 @@ Usage:
 
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, Session
 
 from config import DATABASE_URL
@@ -57,6 +57,16 @@ def init_db():
     """Create all tables. Safe to call multiple times."""
     from models import Base  # noqa: F811
     Base.metadata.create_all(bind=engine)
+    # Migrate: add email_source column if missing (SQLAlchemy create_all won't alter existing tables)
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("PRAGMA table_info(contacts)"))
+            columns = [row[1] for row in result.fetchall()]
+            if "email_source" not in columns:
+                conn.execute(text("ALTER TABLE contacts ADD COLUMN email_source TEXT"))
+                conn.commit()
+    except Exception:
+        pass  # Non-SQLite or column already exists
 
 
 if __name__ == "__main__":

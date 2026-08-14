@@ -84,7 +84,8 @@ class Contact(Base):
     role = Column(String)                           # CTO, Engineering Manager, etc.
     email = Column(String)
     linkedin_url = Column(String)
-    verified = Column(String)                       # VALID, INVALID, None=pending
+    email_source = Column(String)                   # APIFY_VERIFIED, GUESSED, PATTERN_DERIVED
+    verified = Column(String)                       # VALID, INVALID, GUESSED, APIFY_VERIFIED, None=pending
     created_at = Column(DateTime, default=_utcnow)
 
     # Relationships

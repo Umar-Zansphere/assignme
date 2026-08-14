@@ -1,44 +1,61 @@
 """
 watcher.py — Stage 1: Signal Watcher
-Monitors job boards (Greenhouse, Lever, LinkedIn, Upwork), Product Hunt, and RSS feeds for buying signals.
-Stores new companies and their signals in the database.
+
+Monitors LinkedIn for QA role hiring signals (USA focus).
+Stores new companies with FULL enrichment data from LinkedIn
+(website, industry, country, employee count, LinkedIn URL, job poster contact).
+
+This eliminates the need for a separate enrichment stage — LinkedIn
+already provides all the company data we need.
+
+Status flow: NEW_SIGNAL (watcher) → ENRICHED (watcher sets this directly)
+
 Usage:
     python watcher.py
     python watcher.py --dry-run
 """
 import sys
 from database import get_session, init_db
-from models import Company, Signal
-from apify_client import get_new_job_postings, get_linkedin_job_postings, get_upwork_job_postings, get_product_launches, get_company_news
+from models import Company, Signal, Contact
+from apify_client import get_linkedin_job_postings
 from utils import get_logger
 log = get_logger("watcher")
+
+
 def run(dry_run: bool = False):
-    """Fetch signals from all sources and store new ones."""
+    """Fetch QA job signals from LinkedIn (USA), store with full enrichment data."""
     init_db()
-    log.info("Starting signal watcher...")
-    # Collect signals from all sources
-    all_signals = []
+    log.info("Starting signal watcher (QA roles, USA, LinkedIn only)...")
+
     if dry_run:
-        log.info("[DRY RUN] Would fetch from: greenhouse, lever, linkedin, upwork, producthunt, rss")
+        log.info("[DRY RUN] Would fetch from: linkedin")
         log.info("[DRY RUN] Skipping API calls")
         return
-    log.info("Fetching job postings (Greenhouse, Lever)...")
-    all_signals.extend(get_new_job_postings(boards=["greenhouse", "lever"]))
-    log.info("Fetching LinkedIn job postings...")
-    all_signals.extend(get_linkedin_job_postings())
-    log.info("Fetching Upwork job postings...")
-    all_signals.extend(get_upwork_job_postings())
-    log.info("Fetching Product Hunt launches...")
-    all_signals.extend(get_product_launches())
-    log.info("Fetching company news...")
-    all_signals.extend(get_company_news())
-    log.info(f"Collected {len(all_signals)} raw signals")
+
+    # Fetch from LinkedIn (the only source we need)
+    log.info("Fetching LinkedIn QA job postings (USA)...")
+    try:
+        all_signals = get_linkedin_job_postings()
+        log.info(f"LinkedIn: {len(all_signals)} signals collected")
+    except Exception as e:
+        log.error(f"LinkedIn FAILED: {e}")
+        all_signals = []
+
+    if not all_signals:
+        log.info("No signals collected. Exiting.")
+        return
+
     # Deduplicate and store
-    new_count = 0
+    new_companies = 0
+    new_signals = 0
+    new_contacts = 0
+    skipped = 0
+
     with get_session() as session:
         for signal_data in all_signals:
             company_name = signal_data.get("company", "").strip()
             if not company_name or company_name.lower() in ("unknown", "n/a", "none", "null", "undefined") or len(company_name) < 2:
+                skipped += 1
                 continue
 
             raw_url = signal_data.get("url", "").strip()
@@ -49,13 +66,33 @@ def run(dry_run: bool = False):
                 company = next((obj for obj in session.new if isinstance(obj, Company) and obj.name == company_name), None)
 
             if not company:
+                # Create company with ALL LinkedIn enrichment data
                 company = Company(
                     name=company_name,
-                    website=raw_url,
-                    status="NEW_SIGNAL",
+                    website=signal_data.get("company_website", "").strip() or raw_url,
+                    industry=signal_data.get("industry", "").strip(),
+                    country=_normalize_country(signal_data.get("country", "")),
+                    employee_count=signal_data.get("company_employee_count", 0),
+                    linkedin_url=signal_data.get("company_linkedin_url", "").strip(),
+                    # Skip enrichment — go straight to ENRICHED status
+                    status="ENRICHED",
                 )
                 session.add(company)
                 session.flush()  # Get the company ID
+                new_companies += 1
+                log.info(f"  New company: {company_name} (website={company.website}, industry={company.industry}, country={company.country}, employees={company.employee_count})")
+            else:
+                # Update existing company with richer data if we have it
+                if signal_data.get("company_website") and not company.website:
+                    company.website = signal_data["company_website"]
+                if signal_data.get("industry") and not company.industry:
+                    company.industry = signal_data["industry"]
+                if signal_data.get("country") and not company.country:
+                    company.country = _normalize_country(signal_data["country"])
+                if signal_data.get("company_employee_count") and not company.employee_count:
+                    company.employee_count = signal_data["company_employee_count"]
+                if signal_data.get("company_linkedin_url") and not company.linkedin_url:
+                    company.linkedin_url = signal_data["company_linkedin_url"]
 
             # Check for duplicate signal
             signal_type = signal_data.get("signal_type", "UNKNOWN")
@@ -74,9 +111,10 @@ def run(dry_run: bool = False):
                 )
 
             if existing:
+                skipped += 1
                 continue
 
-            # Create new signal
+            # Create new signal with full data
             signal = Signal(
                 company_id=company.id,
                 signal_type=signal_type,
@@ -86,9 +124,65 @@ def run(dry_run: bool = False):
                 raw_url=raw_url,
             )
             session.add(signal)
-            new_count += 1
+            new_signals += 1
 
-    log.info(f"Stored {new_count} new signals")
+            # ── Create contact from job poster (free lead!) ──
+            poster_name = signal_data.get("poster_name", "").strip()
+            poster_profile = signal_data.get("poster_profile_url", "").strip()
+            if poster_name and len(poster_name.split()) >= 2:
+                # Check if contact already exists
+                existing_contact = session.query(Contact).filter_by(
+                    company_id=company.id,
+                    name=poster_name,
+                ).first()
+                if not existing_contact:
+                    existing_contact = next(
+                        (obj for obj in session.new if isinstance(obj, Contact)
+                         and obj.company_id == company.id
+                         and obj.name == poster_name),
+                        None
+                    )
+                if not existing_contact:
+                    contact = Contact(
+                        company_id=company.id,
+                        name=poster_name,
+                        role=signal_data.get("poster_title", ""),
+                        linkedin_url=poster_profile,
+                    )
+                    session.add(contact)
+                    new_contacts += 1
+                    log.info(f"    Contact lead: {poster_name} ({signal_data.get('poster_title', '')})")
+
+    log.info(f"Watcher complete:")
+    log.info(f"  {new_companies} new companies (with full enrichment)")
+    log.info(f"  {new_signals} new signals")
+    log.info(f"  {new_contacts} contact leads from job posters")
+    log.info(f"  {skipped} skipped/duplicates")
+
+
+def _normalize_country(raw: str) -> str:
+    """Normalize country codes to full names."""
+    raw = (raw or "").strip().upper()
+    mapping = {
+        "US": "USA",
+        "USA": "USA",
+        "UNITED STATES": "USA",
+        "UK": "UK",
+        "GB": "UK",
+        "GREAT BRITAIN": "UK",
+        "UNITED KINGDOM": "UK",
+        "DE": "Germany",
+        "GERMANY": "Germany",
+        "FR": "France",
+        "FRANCE": "France",
+        "CA": "Canada",
+        "CANADA": "Canada",
+        "AU": "Australia",
+        "AUSTRALIA": "Australia",
+    }
+    return mapping.get(raw, raw)
+
+
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
     try:

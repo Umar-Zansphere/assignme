@@ -1,12 +1,14 @@
 """
 apify_client.py — Wrapper for Apify actor execution.
 
-Usage:
-    from apify_client import get_new_job_postings, get_product_launches, get_company_news
+Focused on:
+  - LinkedIn job scraping (QA roles, USA)
+  - Email finding via overpowered/email-finder
+  - Google search for contact discovery
+  - Website scraping for enrichment
 
-    jobs = get_new_job_postings()
-    launches = get_product_launches()
-    news = get_company_news(["https://techcrunch.com/feed/"])
+Usage:
+    from apify_client import get_linkedin_job_postings, find_email
 """
 
 import time
@@ -26,24 +28,19 @@ class ApifyError(Exception):
 
 
 # ── Known Actor IDs ─────────────────────────────────────────
-# Replace these with actual Apify actor IDs from the Apify Store.
-# These are real community actors — verify they exist before first run.
 ACTORS = {
-    "greenhouse_scraper": "fantastic-jobs/greenhouse-jobs-api",
-    "lever_scraper": "bovi/greenhouse-lever-ashby-job-scraper",
     "linkedin_scraper": "curious_coder/linkedin-jobs-scraper",
-    "upwork_scraper": "neatrat/upwork-job-scraper",
-    "product_hunt": "maximedupre/product-hunt-scraper",
-    "rss_reader": "automation-lab/rss-feed-reader",
-    "web_scraper": "apify/web-scraper",
+    "email_finder": "overpowered/email-finder",
     "google_search": "apify/google-search-scraper",
 }
 
-# Default LinkedIn search URLs — edit these to match your ICP
+# Default LinkedIn search URLs — QA roles in USA only
 LINKEDIN_SEARCH_URLS = [
     "https://www.linkedin.com/jobs/search/?keywords=qa%20engineer&location=United%20States&f_TPR=r604800",
     "https://www.linkedin.com/jobs/search/?keywords=software%20test%20engineer&location=United%20States&f_TPR=r604800",
     "https://www.linkedin.com/jobs/search/?keywords=sdet&location=United%20States&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=quality%20assurance%20engineer&location=United%20States&f_TPR=r604800",
+    "https://www.linkedin.com/jobs/search/?keywords=test%20automation%20engineer&location=United%20States&f_TPR=r604800",
 ]
 
 
@@ -122,59 +119,18 @@ def run_actor(actor_id: str, input_data: dict, timeout_secs: int = 300) -> list[
         return items
 
 
-# ── Normalized Data Fetchers ──────────────────────────────
-
-def get_new_job_postings(
-    boards: list[str] | None = None,
-) -> list[dict]:
-    """
-    Scrape job boards for engineering hiring signals.
-
-    Returns normalized list:
-        [{"company": str, "title": str, "url": str, "source": str}, ...]
-    """
-    boards = boards or ["greenhouse", "lever"]
-    all_postings = []
-
-    for board in boards:
-        actor_id = ACTORS.get(f"{board}_scraper")
-        if not actor_id:
-            log.warning(f"No actor configured for board: {board}")
-            continue
-
-        try:
-            # Each actor has different input schemas — adjust per actor
-            raw_items = run_actor(actor_id, {
-                "maxItems": 100,
-            })
-
-            for item in raw_items:
-                all_postings.append({
-                    "company": item.get("company") or item.get("companyName", "Unknown"),
-                    "title": item.get("title") or item.get("jobTitle", ""),
-                    "url": item.get("url") or item.get("jobUrl", ""),
-                    "source": board,
-                    "signal_type": "JOB_POSTING",
-                })
-        except Exception as e:
-            log.error(f"Failed to scrape {board}: {e}")
-
-    return all_postings
-
+# ── LinkedIn Job Scraper ──────────────────────────────────
 
 def get_linkedin_job_postings(
     search_urls: list[str] | None = None,
     max_results: int = 100,
 ) -> list[dict]:
     """
-    Scrape LinkedIn for job postings using curious_coder/linkedin-jobs-scraper.
+    Scrape LinkedIn for QA job postings using curious_coder/linkedin-jobs-scraper.
 
-    Args:
-        search_urls: LinkedIn job search URLs. Defaults to LINKEDIN_SEARCH_URLS.
-        max_results: Max jobs to scrape per URL.
-
-    Returns normalized list:
-        [{"company": str, "title": str, "url": str, "source": str, "description": str}, ...]
+    Returns normalized list with ALL available data from the LinkedIn API,
+    including company enrichment data and job poster contact info.
+    This eliminates the need for a separate enrichment stage.
     """
     urls = search_urls or LINKEDIN_SEARCH_URLS
 
@@ -189,222 +145,187 @@ def get_linkedin_job_postings(
         return []
 
     results = []
+    seen_urls: set[str] = set()
+
     for item in raw_items:
-        company_name = (
-            item.get("companyName")
-            or item.get("company", {}).get("name", "")
-            if isinstance(item.get("company"), dict)
-            else item.get("company", "")
-        ) or "Unknown"
-
-        results.append({
-            "company": company_name.strip(),
-            "title": item.get("title") or item.get("jobTitle", ""),
-            "url": item.get("jobUrl") or item.get("url", ""),
-            "description": item.get("description", "")[:500],
-            "source": "linkedin",
-            "signal_type": "JOB_POSTING",
-        })
-
-    log.info(f"LinkedIn returned {len(results)} job postings")
-    return results
-
-
-# Default Upwork search queries — targets companies posting QA/testing/automation work
-UPWORK_SEARCH_QUERIES = [
-    "QA engineer",
-    "software test automation",
-    "SDET selenium pytest",
-    "quality assurance testing",
-]
-
-
-def get_upwork_job_postings(
-    search_queries: list[str] | None = None,
-    max_results: int = 50,
-) -> list[dict]:
-    """
-    Scrape Upwork for job postings using neatrat/upwork-job-scraper.
-
-    Args:
-        search_queries: List of search keyword strings.
-        max_results: Max jobs to return per query.
-
-    Returns normalized list:
-        [{"company": str, "title": str, "url": str, "source": str,
-          "description": str, "signal_type": str}, ...]
-    """
-    queries = search_queries or UPWORK_SEARCH_QUERIES
-    all_results = []
-
-    for query in queries:
-        try:
-            raw_items = run_actor(ACTORS["upwork_scraper"], {
-                "query": query,
-                "perPage": min(max_results, 50),
-                "pagesToScrape": 1,
-            })
-        except Exception as e:
-            log.error(f"Failed to scrape Upwork for query '{query}': {e}")
-            continue
-
-        seen_urls: set[str] = set()
-        for item in raw_items:
-            # Upwork actor returns clientInfo dict or various company fields
-            client_info = item.get("clientInfo")
-            company_name = (
-                (client_info.get("companyName", "") if isinstance(client_info, dict) else "")
-                or item.get("company", "")
-                or item.get("clientName", "")
-                or ""
-            ).strip()
-
-            # Fall back to a cleaned-up title when no company name is available
-            if not company_name:
-                title_raw = item.get("title", "") or item.get("jobTitle", "") or ""
-                company_name = title_raw[:60].strip() or "Unknown"
-
-            job_url = (
-                item.get("url")
-                or item.get("jobUrl")
-                or item.get("link")
-                or ""
-            ).strip()
-
-            if not job_url or job_url in seen_urls:
-                continue
-            seen_urls.add(job_url)
-
-            all_results.append({
-                "company": company_name,
-                "title": item.get("title") or item.get("jobTitle", "") or "",
-                "url": job_url,
-                "description": (item.get("description") or item.get("snippet") or "")[:500],
-                "source": "upwork",
-                "signal_type": "JOB_POSTING",
-            })
-
-
-    log.info(f"Upwork returned {len(all_results)} job postings")
-    return all_results
-
-
-def get_product_launches() -> list[dict]:
-    """
-    Scrape Product Hunt for new product launches.
-
-    Returns normalized list:
-        [{"company": str, "title": str, "url": str, "source": str}, ...]
-    """
-    try:
-        raw_items = run_actor(ACTORS["product_hunt"], {
-            "target": "daily",
-            "maxItems": 30,
-        })
-    except Exception as e:
-        log.error(f"Failed to scrape Product Hunt: {e}")
-        return []
-
-    results = []
-    for item in raw_items:
-        results.append({
-            "company": item.get("name") or item.get("title", "Unknown"),
-            "title": item.get("tagline") or item.get("title", ""),
-            "url": item.get("url") or item.get("websiteUrl", ""),
-            "description": item.get("description", ""),
-            "source": "producthunt",
-            "signal_type": "PRODUCT_LAUNCH",
-        })
-
-    return results
-
-def _extract_company_from_title(title: str) -> str:
-    """Extract likely company name from a news headline."""
-    if not title:
-        return ""
-    
-    # Unescape HTML entities (e.g. &#8217;, &amp;)
-    cleaned = html.unescape(title).strip()
-    
-    # Strip common editorial prefixes
-    cleaned = re.sub(r'^(Exclusive|Report|Breaking|Analysis|Watch|Video|Podcast|Interview|Review|Opinion):\s*', '', cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r'^(Defense tech|Fintech|Biotech|Health tech|Crypto|AI startup|Startup)\s+', '', cleaned, flags=re.IGNORECASE).strip()
-
-    # Skip non-company editorial / promo headlines
-    lower = cleaned.lower()
-    if any(lower.startswith(p) for p in ("get up to", "your table", "how to", "why ", "what ", "where ", "here's ", "here is ", "vogue just", "hacker pleads", "gen z ")):
-        return ""
-
-    # Check for "<Company>'s ..."
-    match_possessive = re.match(r"^([A-Z0-9][A-Za-z0-9\.\s&-]+?)['’]s\b", cleaned)
-    if match_possessive:
-        candidate = match_possessive.group(1).strip()
-        if len(candidate) > 1 and candidate.lower() not in ("here", "there", "everyone", "today", "yesterday"):
-            return candidate
-
-    # Check for common headline patterns: "<Company> raises...", "<Company> acquires...", etc.
-    match = re.match(r'^([A-Z0-9][A-Za-z0-9\.\s&-]+?)(?:\s+(?:raises|acquires|launches|partners|hires|secures|unveils|expands|leads|inks|files|debuts|rolls out|says|plans|builds|to\s+|and\s+|lays off|shuts|closes|buys|brings))\b', cleaned)
-    if match:
-        candidate = match.group(1).strip()
-        if len(candidate) > 1 and candidate.lower() not in ("why", "how", "what", "where", "when", "here", "this", "after", "amid", "as", "new", "get", "chatgpt"):
-            return candidate
-
-    # Fallback: take first 1-2 capitalized words if reasonable
-    words = cleaned.split()
-    cap_words = []
-    for w in words[:2]:
-        if w and w[0].isupper() and w.lower() not in ("why", "how", "what", "where", "when", "here", "this", "after", "amid", "as", "exclusive", "report", "breaking", "analysis", "watch", "get", "your"):
-            cap_words.append(w)
+        # Extract company name — handle dict or string formats
+        company_name = ""
+        company_field = item.get("company")
+        if isinstance(company_field, dict):
+            company_name = company_field.get("name", "") or item.get("companyName", "")
+        elif isinstance(company_field, str):
+            company_name = company_field
         else:
-            break
-    if cap_words:
-        return " ".join(cap_words)
+            company_name = item.get("companyName", "")
 
-    return ""
-
-
-def get_company_news(rss_urls: list[str] | None = None) -> list[dict]:
-    """
-    Scrape RSS feeds / news sources.
-
-    Returns normalized list:
-        [{"company": str, "title": str, "url": str, "source": str, "description": str}, ...]
-    """
-    rss_urls = rss_urls or [
-        "https://techcrunch.com/feed/",
-    ]
-
-    try:
-        raw_items = run_actor(ACTORS["rss_reader"], {
-            "feeds": rss_urls,
-            "maxItemsPerFeed": 50,
-        })
-    except Exception as e:
-        log.error(f"Failed to scrape RSS: {e}")
-        return []
-
-    results = []
-    for item in raw_items:
-        title = item.get("title", "").strip()
-        if not title:
+        company_name = (company_name or "").strip()
+        if not company_name or company_name.lower() in ("unknown", "n/a", "none"):
             continue
 
-        company_name = _extract_company_from_title(title)
-        # Avoid using journalist author as company name
-        if not company_name:
+        # Build job URL — try multiple fields, fall back to constructing from ID
+        job_url = (item.get("jobUrl") or item.get("url") or item.get("link") or "").strip()
+        if not job_url and item.get("id"):
+            job_url = f"https://www.linkedin.com/jobs/view/{item['id']}"
+
+        if not job_url or job_url in seen_urls:
             continue
+        seen_urls.add(job_url)
+
+        # ── Extract ALL rich data from LinkedIn response ──
+
+        # Company website (top-level field or nested in company dict)
+        company_website = (
+            item.get("companyWebsite", "")
+            or (company_field.get("companyUrl", "") if isinstance(company_field, dict) else "")
+            or (company_field.get("websiteUrl", "") if isinstance(company_field, dict) else "")
+            or ""
+        ).strip()
+
+        # Company LinkedIn URL
+        company_linkedin_url = (
+            item.get("companyLinkedinUrl", "")
+            or (company_field.get("linkedInUrl", "") if isinstance(company_field, dict) else "")
+            or ""
+        ).strip()
+
+        # Company description
+        company_description = (item.get("companyDescription", "") or "").strip()
+
+        # Employee count
+        company_employee_count = 0
+        raw_emp = item.get("companyEmployeesCount")
+        if isinstance(raw_emp, int):
+            company_employee_count = raw_emp
+        elif isinstance(raw_emp, str):
+            try:
+                company_employee_count = int(raw_emp.replace(",", "").strip())
+            except (ValueError, AttributeError):
+                pass
+
+        # Location & Country
+        location = (item.get("location", "") or item.get("jobLocation", "") or "").strip()
+        country = ""
+        addr = item.get("companyAddress")
+        if isinstance(addr, dict):
+            country = addr.get("addressCountry", "")
+        # Fallback: if location mentions US states/cities, assume USA
+        if not country and location:
+            us_indicators = (
+                "United States", ", CA", ", NY", ", TX", ", WA", ", IL",
+                ", MA", ", CO", ", GA", ", FL", ", NC", ", VA",
+                "Remote", "Hybrid", "Metropolitan Area",
+            )
+            if any(ind in location for ind in us_indicators):
+                country = "US"
+
+        # Industry
+        industry = (item.get("industries", "") or "").strip()
+
+        # Job metadata
+        seniority_level = (item.get("seniorityLevel", "") or "").strip()
+        employment_type = (item.get("employmentType", "") or "").strip()
+        job_function = (item.get("jobFunction", "") or "").strip()
+
+        # Job poster info (direct contact lead!)
+        poster_name = (item.get("jobPosterName", "") or "").strip()
+        poster_title = (item.get("jobPosterTitle", "") or "").strip()
+        poster_profile_url = (item.get("jobPosterProfileUrl", "") or "").strip()
+
+        # Salary & applicants
+        salary_info = item.get("salaryInfo", []) or []
+        applicants_count = (item.get("applicantsCount", "") or "").strip()
+
+        # Job description — keep full text for research stage
+        description_text = (
+            item.get("descriptionText", "")
+            or item.get("description", "")
+            or ""
+        ).strip()
 
         results.append({
             "company": company_name,
-            "title": title,
-            "url": item.get("link") or item.get("url", ""),
-            "description": item.get("description") or item.get("summary", ""),
-            "source": "rss",
-            "signal_type": "NEWS",
+            "title": item.get("title") or item.get("jobTitle", ""),
+            "url": job_url,
+            "description": description_text[:2000],       # Keep more text for research
+            "source": "linkedin",
+            "signal_type": "JOB_POSTING",
+            # Company enrichment data (replaces enrichment.py!)
+            "company_website": company_website,
+            "company_linkedin_url": company_linkedin_url,
+            "company_description": company_description[:1000],
+            "company_employee_count": company_employee_count,
+            "location": location,
+            "country": country,
+            "industry": industry,
+            # Job poster as a direct contact lead
+            "poster_name": poster_name,
+            "poster_title": poster_title,
+            "poster_profile_url": poster_profile_url,
+            # Extra metadata
+            "seniority_level": seniority_level,
+            "employment_type": employment_type,
+            "job_function": job_function,
+            "salary_info": salary_info,
+            "applicants_count": applicants_count,
         })
 
+    log.info(f"LinkedIn returned {len(results)} QA job postings")
     return results
 
+
+# ── Email Finder (Apify) ─────────────────────────────────
+
+def find_email(first_name: str, last_name: str, domain: str) -> dict:
+    """
+    Find a verified email address using the overpowered/email-finder Apify actor.
+
+    Args:
+        first_name: Person's first name.
+        last_name: Person's last name (surname).
+        domain: Company domain (e.g., 'company.com').
+
+    Returns:
+        dict with keys:
+            - "email": str (found email or "")
+            - "verified": bool (True if Apify confirmed deliverable)
+            - "source": str ("APIFY_VERIFIED" or "NOT_FOUND")
+            - "raw": dict (full actor response)
+    """
+    if not first_name or not last_name or not domain:
+        log.warning(f"find_email: missing inputs — name='{first_name} {last_name}', domain='{domain}'")
+        return {"email": "", "verified": False, "source": "NOT_FOUND", "raw": {}}
+
+    try:
+        items = run_actor(ACTORS["email_finder"], {
+            "name": first_name.strip().lower(),
+            "surname": last_name.strip().lower(),
+            "domain": domain.strip().lower(),
+        }, timeout_secs=120)
+
+        if items and len(items) > 0:
+            result = items[0]
+            email = result.get("email", "") or result.get("Email", "") or ""
+            # Check verification status from actor output
+            is_verified = result.get("verified", False) or result.get("deliverable", False) or bool(email)
+
+            if email:
+                log.info(f"Email finder found: {email} (verified={is_verified})")
+                return {
+                    "email": email,
+                    "verified": is_verified,
+                    "source": "APIFY_VERIFIED" if is_verified else "APIFY_UNVERIFIED",
+                    "raw": result,
+                }
+
+        log.info(f"Email finder: no email found for {first_name} {last_name} @ {domain}")
+        return {"email": "", "verified": False, "source": "NOT_FOUND", "raw": {}}
+
+    except Exception as e:
+        log.error(f"Email finder failed for {first_name} {last_name} @ {domain}: {e}")
+        return {"email": "", "verified": False, "source": "NOT_FOUND", "raw": {}}
+
+
+# ── Website Scraper ───────────────────────────────────────
 
 def _clean_html_text(raw_html: str, max_chars: int = 5000) -> str:
     """Strip script, style, navigation tags and return clean plain text."""
@@ -427,7 +348,7 @@ def scrape_website(url: str) -> str:
     Scrape a single webpage and return its text content.
 
     Prioritizes fast direct HTTP fetching, falling back to Jina reader API.
-    Used by enrichment.py for extracting company info.
+    Used by research.py for extracting company info.
     """
     if not url:
         return ""
@@ -468,6 +389,8 @@ def scrape_website(url: str) -> str:
 
     return ""
 
+
+# ── Google Search ─────────────────────────────────────────
 
 def search_google(query: str, max_results: int = 5) -> list[dict]:
     """

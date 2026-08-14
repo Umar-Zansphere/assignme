@@ -87,7 +87,8 @@ def run(dry_run: bool = False):
 
             contact = (
                 session.query(Contact)
-                .filter_by(company_id=cid, verified="VALID")
+                .filter_by(company_id=cid)
+                .filter(Contact.verified.in_(["VALID", "APIFY_VERIFIED"]))
                 .first()
             )
             if not contact:

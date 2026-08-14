@@ -95,6 +95,10 @@ def calculate_score(company: Company, signals: list[Signal]) -> tuple[int, list[
         pts = ICP_SCORING_RULES.get("employee_200_1000", 10)
         score += pts
         reasons.append(f"200-1000 employees: +{pts}")
+    elif emp > 10000:
+        pts = ICP_SCORING_RULES.get("employee_10000_plus", -50)
+        score += pts
+        reasons.append(f">10000 employees: {pts} (Enterprise Penalty)")
 
     return score, reasons
 

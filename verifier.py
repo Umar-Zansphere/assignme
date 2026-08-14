@@ -2,7 +2,8 @@
 verifier.py — Stage 5: Email Verification
 
 Verifies contact email addresses using SMTP MX lookup + RCPT TO check.
-Marks contacts as VALID or INVALID.
+Skips re-verification for emails already verified by Apify email finder.
+Marks contacts as VALID, INVALID, or keeps APIFY_VERIFIED.
 
 Usage:
     python verifier.py
@@ -89,16 +90,24 @@ def verify_email_basic(email: str) -> bool:
 
 
 def run(dry_run: bool = False):
-    """Verify all unverified contacts."""
+    """Verify all unverified contacts. Skip Apify-verified ones."""
     init_db()
     log.info("Starting email verification...")
 
     with get_session() as session:
-        contacts = session.query(Contact).filter(Contact.verified.is_(None)).all()
-        log.info(f"Found {len(contacts)} contacts to verify")
+        # Get contacts that need verification
+        # Skip already-verified (APIFY_VERIFIED, VALID, INVALID)
+        contacts = session.query(Contact).filter(
+            Contact.verified.in_([None, "GUESSED", "APIFY_UNVERIFIED"])
+        ).all()
+
+        # Also count Apify-verified contacts for status update
+        apify_verified = session.query(Contact).filter_by(verified="APIFY_VERIFIED").all()
+        log.info(f"Found {len(contacts)} contacts to verify, {len(apify_verified)} already Apify-verified")
 
         valid_count = 0
         invalid_count = 0
+        skipped_count = 0
 
         for contact in contacts:
             if not contact.email:
@@ -106,7 +115,7 @@ def run(dry_run: bool = False):
                 invalid_count += 1
                 continue
 
-            log.info(f"  Verifying: {contact.email}")
+            log.info(f"  Verifying: {contact.email} (source: {contact.email_source or 'unknown'})")
 
             if dry_run:
                 log.info(f"    [DRY RUN] Would verify {contact.email}")
@@ -118,12 +127,14 @@ def run(dry_run: bool = False):
                 if not is_valid:
                     is_valid = verify_email_basic(contact.email)
 
-                contact.verified = "VALID" if is_valid else "INVALID"
-
                 if is_valid:
+                    contact.verified = "VALID"
                     valid_count += 1
                     log.info(f"    [OK] VALID")
                 else:
+                    # For guessed emails, mark as INVALID
+                    # For Apify-unverified, mark as INVALID too
+                    contact.verified = "INVALID"
                     invalid_count += 1
                     log.info(f"    [FAIL] INVALID")
 
@@ -133,6 +144,7 @@ def run(dry_run: bool = False):
                 invalid_count += 1
 
         # Update company statuses
+        # Companies with APIFY_VERIFIED or VALID contacts should advance
         if not dry_run:
             companies_with_contacts = (
                 session.query(Company)
@@ -140,16 +152,21 @@ def run(dry_run: bool = False):
                 .all()
             )
             for company in companies_with_contacts:
-                valid_contacts = (
+                # Count all usable contacts (APIFY_VERIFIED or VALID)
+                usable_contacts = (
                     session.query(Contact)
-                    .filter_by(company_id=company.id, verified="VALID")
+                    .filter(
+                        Contact.company_id == company.id,
+                        Contact.verified.in_(["VALID", "APIFY_VERIFIED"])
+                    )
                     .count()
                 )
-                if valid_contacts > 0:
+                if usable_contacts > 0:
                     company.status = "EMAIL_VERIFIED"
                     company.updated_at = utcnow()
+                    log.info(f"  Company '{company.name}' → EMAIL_VERIFIED ({usable_contacts} valid contacts)")
 
-        log.info(f"Verification complete: {valid_count} valid, {invalid_count} invalid")
+        log.info(f"Verification complete: {valid_count} valid, {invalid_count} invalid, {len(apify_verified)} apify-verified (skipped)")
 
 
 if __name__ == "__main__":

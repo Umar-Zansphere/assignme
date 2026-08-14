@@ -44,7 +44,7 @@ else:
     DATABASE_URL = raw_db_url
 
 # ── ICP Scoring ────────────────────────────────────────────
-ICP_SCORE_THRESHOLD: int = int(os.getenv("ICP_SCORE_THRESHOLD", "40"))
+ICP_SCORE_THRESHOLD: int = int(os.getenv("ICP_SCORE_THRESHOLD", "60"))
 
 # Scoring weights (rule → points)
 ICP_SCORING_RULES: dict[str, int] = {
@@ -56,6 +56,7 @@ ICP_SCORING_RULES: dict[str, int] = {
     "europe": 5,
     "employee_20_200": 20,
     "employee_200_1000": 10,
+    "employee_10000_plus": -50,  # Penalty for massive enterprises
     "product_launch": 15,
     "recent_funding": 25,
     "company_news": 15,

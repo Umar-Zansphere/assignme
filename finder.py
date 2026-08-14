@@ -3,6 +3,7 @@ finder.py — Stage 4: Decision Maker Finder
 
 Finds CTO / Engineering Manager / Head of Product for qualified companies.
 Uses Apify Google Search to find LinkedIn profiles, then extracts contact info.
+Uses Apify overpowered/email-finder for email discovery (not guessing).
 
 Usage:
     python finder.py
@@ -13,7 +14,7 @@ import sys
 
 from database import get_session, init_db
 from models import Company, Contact
-from apify_client import search_google
+from apify_client import search_google, find_email
 from openrouter_client import call_llm_with_schema
 from utils import get_logger, extract_domain, guess_email, utcnow
 
@@ -47,6 +48,7 @@ def run(dry_run: bool = False):
         log.info(f"Found {len(companies)} companies to find contacts for")
 
     found = 0
+    failed = 0
 
     for cid in company_ids:
         with get_session() as session:
@@ -90,15 +92,6 @@ def run(dry_run: bool = False):
                     if not name:
                         continue
 
-                    # Guess email
-                    domain = extract_domain(company.website or "")
-                    if not domain or any(d in domain for d in ("techcrunch.com", "producthunt.com", "ycombinator.com", "news", "reuters.com", "bloomberg.com")):
-                        domain = f"{company.name.lower().replace(' ', '')}.com"
-
-                    first_name = data.get("first_name", "").strip() or (name.split()[0] if name else "")
-                    last_name = data.get("last_name", "").strip() or (name.split()[-1] if len(name.split()) > 1 else "")
-                    email_guesses = guess_email(first_name, last_name, domain) if domain else []
-
                     # Check for duplicate contact
                     existing = session.query(Contact).filter_by(
                         company_id=company.id,
@@ -108,30 +101,65 @@ def run(dry_run: bool = False):
                     if existing:
                         continue
 
+                    # Extract name parts
+                    first_name = data.get("first_name", "").strip() or (name.split()[0] if name else "")
+                    last_name = data.get("last_name", "").strip() or (name.split()[-1] if len(name.split()) > 1 else "")
+
+                    # Determine company domain
+                    domain = extract_domain(company.website or "")
+                    if not domain or any(d in domain for d in ("techcrunch.com", "producthunt.com", "ycombinator.com", "news", "reuters.com", "bloomberg.com", "upwork.com", "linkedin.com")):
+                        domain = f"{company.name.lower().replace(' ', '')}.com"
+
+                    # Step 1: Try Apify email finder (real verification)
+                    log.info(f"  Looking up email via Apify: {first_name} {last_name} @ {domain}")
+                    email_result = find_email(first_name, last_name, domain)
+
+                    email_address = ""
+                    email_source = ""
+                    verified_status = None
+
+                    if email_result["email"]:
+                        # Apify found a real email
+                        email_address = email_result["email"]
+                        email_source = email_result["source"]  # APIFY_VERIFIED or APIFY_UNVERIFIED
+                        verified_status = "APIFY_VERIFIED" if email_result["verified"] else "APIFY_UNVERIFIED"
+                        log.info(f"  [APIFY] Found email: {email_address} ({email_source})")
+                    else:
+                        # Step 2: Fall back to pattern guessing
+                        email_guesses = guess_email(first_name, last_name, domain) if domain else []
+                        email_address = email_guesses[0] if email_guesses else f"{first_name.lower()}@{domain}"
+                        email_source = "GUESSED"
+                        verified_status = "GUESSED"
+                        log.info(f"  [GUESSED] Pattern-derived email: {email_address}")
+
                     contact = Contact(
                         company_id=company.id,
                         name=name,
                         role=data.get("role", role),
-                        email=email_guesses[0] if email_guesses else f"{first_name.lower()}@{domain}",
+                        email=email_address,
                         linkedin_url=data.get("linkedin_url", ""),
+                        email_source=email_source,
+                        verified=verified_status,
                     )
                     session.add(contact)
                     contact_found = True
 
-                    log.info(f"  [OK] Found: {name} ({contact.role}) - {contact.email}")
-                    break  # One contact per company is enough for MWM
+                    log.info(f"  [OK] Found: {name} ({contact.role}) - {contact.email} [{email_source}]")
+                    break  # One contact per company is enough
 
                 if contact_found:
                     company.status = "CONTACT_FOUND"
                     company.updated_at = utcnow()
                     found += 1
                 else:
+                    failed += 1
                     log.warning(f"  [FAIL] No contacts found for {company.name}")
 
             except Exception as e:
+                failed += 1
                 log.error(f"  [FAIL] Failed for {company.name}: {e}")
 
-    log.info(f"Found contacts for {found} companies")
+    log.info(f"Found contacts for {found} companies ({failed} failed)")
 
 
 if __name__ == "__main__":

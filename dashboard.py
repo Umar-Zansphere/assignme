@@ -1,9 +1,15 @@
 """
 dashboard.py — Sales Machine Full Pipeline Dashboard
 
-Shows data from every pipeline module:
-  watcher → enrichment → scorer → finder → verifier
+Shows detailed data from every pipeline module:
+  watcher → scorer → finder → verifier
   → research → email_writer → sender → reply_checker
+
+Features:
+  - Detailed data views for each stage
+  - Editable email content before sending
+  - Email source badges (APIFY_VERIFIED / GUESSED)
+  - Full pipeline funnel visualization
 
 Usage:
     python -m streamlit run dashboard.py
@@ -83,6 +89,20 @@ section[data-testid="stSidebar"] {
     margin: 12px 0 8px 0;
 }
 
+/* Detail card */
+.detail-card {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 16px;
+    margin: 8px 0;
+}
+
+/* Email source badges */
+.badge-apify { background:#1c4532; color:#68d391; padding:3px 10px; border-radius:12px; font-size:0.72rem; font-weight:600; }
+.badge-guessed { background:#744210; color:#f6e05e; padding:3px 10px; border-radius:12px; font-size:0.72rem; font-weight:600; }
+.badge-invalid { background:#742a2a; color:#fc8181; padding:3px 10px; border-radius:12px; font-size:0.72rem; font-weight:600; }
+
 h1 {
     background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
     -webkit-background-clip: text;
@@ -110,17 +130,11 @@ STATUS_COLOR = {
     "REPLIED":       "#48bb78",
 }
 SOURCE_COLOR = {
-    "upwork":      "#14a800",
     "linkedin":    "#0a66c2",
-    "greenhouse":  "#3bba4c",
-    "lever":       "#5db7de",
-    "producthunt": "#da552f",
-    "rss":         "#f59e0b",
 }
 
 PIPELINE_STAGES = [
-    ("📡 Watcher",        "NEW_SIGNAL",    "#718096"),
-    ("🔬 Enrichment",     "ENRICHED",      "#4299e1"),
+    ("📡 Watcher",        "ENRICHED",      "#4299e1"),
     ("🎯 Scorer",         "QUALIFIED",     "#48bb78"),
     ("🔍 Finder",         "CONTACT_FOUND", "#9f7aea"),
     ("✅ Verifier",       "EMAIL_VERIFIED","#38b2ac"),
@@ -144,14 +158,15 @@ def load_stats():
                                     "RESEARCH_DONE","EMAIL_READY","EMAIL_SENT","REPLIED"])).count(),
             "rejected":          s.query(Company).filter_by(status="REJECTED").count(),
             "contacts_found":    s.query(Contact).count(),
-            "contacts_verified": s.query(Contact).filter_by(verified="VALID").count(),
+            "contacts_verified": s.query(Contact).filter(Contact.verified.in_(["VALID", "APIFY_VERIFIED"])).count(),
+            "contacts_guessed":  s.query(Contact).filter_by(verified="GUESSED").count(),
             "research_done":     s.query(Research).count(),
             "emails_sent":       s.query(Email).filter_by(status="SENT").count(),
             "emails_scheduled":  s.query(Email).filter_by(status="SCHEDULED").count(),
             "emails_draft":      s.query(Email).filter_by(status="DRAFT").count(),
             "replies":           s.query(ReplyLog).count(),
             "new_signal":        s.query(Company).filter_by(status="NEW_SIGNAL").count(),
-            "upwork_signals":    s.query(Signal).filter_by(source="upwork").count(),
+            "linkedin_signals":  s.query(Signal).filter_by(source="linkedin").count(),
         }
         # reply rate
         c_emailed = s.query(func.count(func.distinct(Email.company_id))).filter_by(status="SENT").scalar() or 0
@@ -180,14 +195,16 @@ def load_stats():
 def load_signals():
     init_db()
     with get_session() as s:
-        rows = (s.query(Signal, Company.name.label("co"))
+        rows = (s.query(Signal, Company.name.label("co"), Company.status.label("co_status"))
                 .join(Company, Signal.company_id == Company.id)
                 .order_by(Signal.detected_at.desc()).limit(500).all())
         return pd.DataFrame([{
             "Company":  r.co,
+            "Status":   r.co_status,
             "Type":     r.Signal.signal_type,
             "Source":   r.Signal.source or "",
             "Title":    r.Signal.title or "",
+            "Description": (r.Signal.description or "")[:200],
             "URL":      r.Signal.raw_url or "",
             "Detected": r.Signal.detected_at,
         } for r in rows])
@@ -218,17 +235,19 @@ def load_companies():
 def load_contacts():
     init_db()
     with get_session() as s:
-        rows = (s.query(Contact, Company.name.label("co"))
+        rows = (s.query(Contact, Company.name.label("co"), Company.status.label("co_status"))
                 .join(Company, Contact.company_id == Company.id)
                 .order_by(Contact.created_at.desc()).all())
         return pd.DataFrame([{
-            "Company":   r.co,
-            "Name":      r.Contact.name or "",
-            "Role":      r.Contact.role or "",
-            "Email":     r.Contact.email or "",
-            "LinkedIn":  r.Contact.linkedin_url or "",
-            "Verified":  r.Contact.verified or "PENDING",
-            "Found At":  r.Contact.created_at,
+            "Company":      r.co,
+            "Co. Status":   r.co_status,
+            "Name":         r.Contact.name or "",
+            "Role":         r.Contact.role or "",
+            "Email":        r.Contact.email or "",
+            "Email Source":  r.Contact.email_source or "UNKNOWN",
+            "LinkedIn":     r.Contact.linkedin_url or "",
+            "Verified":     r.Contact.verified or "PENDING",
+            "Found At":     r.Contact.created_at,
         } for r in rows])
 
 
@@ -251,15 +270,25 @@ def load_research():
                 tech_stack = json.loads(r.Research.tech_stack or "[]")
             except Exception:
                 tech_stack = [r.Research.tech_stack] if r.Research.tech_stack else []
+
+            # Parse raw_json for talking_points and urgency
+            raw_data = {}
+            try:
+                raw_data = json.loads(r.Research.raw_json or "{}")
+            except Exception:
+                pass
+
             data.append({
-                "Company":     r.co,
-                "Industry":    r.industry or "",
-                "Country":     r.country or "",
-                "Summary":     r.Research.summary or "",
-                "Pain Points": ", ".join(pain_points) if isinstance(pain_points, list) else str(pain_points),
-                "Tech Stack":  ", ".join(tech_stack) if isinstance(tech_stack, list) else str(tech_stack),
-                "Recent News": r.Research.recent_news or "",
-                "Created":     r.Research.created_at,
+                "Company":       r.co,
+                "Industry":      r.industry or "",
+                "Country":       r.country or "",
+                "Summary":       r.Research.summary or "",
+                "Pain Points":   ", ".join(pain_points) if isinstance(pain_points, list) else str(pain_points),
+                "Tech Stack":    ", ".join(tech_stack) if isinstance(tech_stack, list) else str(tech_stack),
+                "Recent News":   r.Research.recent_news or "",
+                "Talking Points": ", ".join(raw_data.get("talking_points", [])) if raw_data.get("talking_points") else "",
+                "Urgency":       raw_data.get("urgency", ""),
+                "Created":       r.Research.created_at,
             })
         return pd.DataFrame(data)
 
@@ -268,17 +297,20 @@ def load_research():
 def load_emails():
     init_db()
     with get_session() as s:
-        rows = (s.query(Email, Contact.email.label("to_email"), Company.name.label("co"))
+        rows = (s.query(Email, Contact.email.label("to_email"), Contact.name.label("contact_name"),
+                        Company.name.label("co"))
                 .join(Contact, Email.contact_id == Contact.id)
                 .join(Company, Email.company_id == Company.id)
                 .order_by(Email.sent_at.desc().nullslast()).limit(200).all())
         return pd.DataFrame([{
+            "ID":        r.Email.id,
             "Company":   r.co,
+            "Contact":   r.contact_name,
             "To":        r.to_email,
             "Subject":   r.Email.subject or "",
             "Seq":       r.Email.sequence_number,
             "Status":    r.Email.status,
-            "Body":      (r.Email.body or "")[:120] + "…" if r.Email.body and len(r.Email.body) > 120 else (r.Email.body or ""),
+            "Body":      r.Email.body or "",
             "Scheduled": r.Email.scheduled_at,
             "Sent":      r.Email.sent_at,
         } for r in rows])
@@ -296,6 +328,7 @@ def load_replies():
             "From":     r.ReplyLog.reply_from or "",
             "Subject":  r.ReplyLog.reply_subject or "",
             "Preview":  (r.ReplyLog.reply_body or "")[:200],
+            "Body":     r.ReplyLog.reply_body or "",
             "Detected": r.ReplyLog.detected_at,
         } for r in rows])
 
@@ -304,6 +337,17 @@ def load_replies():
 def status_pill(status: str) -> str:
     color = STATUS_COLOR.get(status, "#718096")
     return f'<span style="background:{color}22;color:{color};padding:2px 10px;border-radius:12px;font-size:0.72rem;font-weight:600;">{status}</span>'
+
+
+def email_source_badge(source: str) -> str:
+    if source in ("APIFY_VERIFIED",):
+        return '<span class="badge-apify">✅ APIFY VERIFIED</span>'
+    elif source in ("GUESSED", "PATTERN_DERIVED"):
+        return '<span class="badge-guessed">⚠️ GUESSED</span>'
+    elif source == "APIFY_UNVERIFIED":
+        return '<span class="badge-guessed">🔍 APIFY (UNVERIFIED)</span>'
+    else:
+        return '<span class="badge-invalid">❓ UNKNOWN</span>'
 
 
 def module_header(icon: str, name: str, description: str, color: str = "#667eea"):
@@ -332,11 +376,12 @@ def source_pills(df: pd.DataFrame):
 # ── Sidebar ────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🚀 Sales Machine")
+    st.markdown("*QA Leads Pipeline (USA)*")
     st.markdown("---")
-    page = st.radio("", [
+    page = st.radio("Navigation", [
         "📊 Pipeline Monitor",
         "📡 Watcher — Signals",
-        "🔬 Enrichment — Companies",
+        "🏢 Companies",
         "🎯 Scorer — Qualification",
         "🔍 Finder & ✅ Verifier — Contacts",
         "📚 Research — Intelligence",
@@ -366,7 +411,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════
 if page == "📊 Pipeline Monitor":
     st.title("Pipeline Monitor")
-    st.caption("Real-time view of every module and how data flows through the pipeline.")
+    st.caption("Real-time view of every module — QA Leads Pipeline (LinkedIn, USA)")
 
     stats = load_stats()
 
@@ -415,29 +460,19 @@ if page == "📊 Pipeline Monitor":
     r1c1, r1c2 = st.columns(2)
 
     with r1c1:
-        module_header("📡", "Watcher", "Collects buying signals from job boards & RSS", "#f59e0b")
-        sources = stats.get("signal_sources", {})
-        types   = stats.get("signal_types", {})
+        module_header("📡", "Watcher", "LinkedIn QA signals (USA)", "#f59e0b")
         mc1,mc2,mc3 = st.columns(3)
         mc1.metric("Total Signals",  stats["total_signals"])
-        mc2.metric("Sources Active", len(sources))
-        mc3.metric("Upwork Signals", stats["upwork_signals"])
-        if sources:
-            src_df = pd.DataFrame({"Source": list(sources.keys()), "Count": list(sources.values())})
-            st.dataframe(src_df, hide_index=True, use_container_width=True, height=120)
+        mc2.metric("LinkedIn",       stats["linkedin_signals"])
+        mc3.metric("Companies",      stats["total_companies"])
 
     with r1c2:
-        module_header("🔬", "Enrichment", "Classifies company industry & country via LLM", "#4299e1")
-        enriched = s_enriched = stats["total_companies"] - stats["new_signal"] - stats["rejected"]
+        module_header("🏢", "Companies", "Enriched directly from LinkedIn data", "#4299e1")
+        enriched = stats["total_companies"] - stats["new_signal"] - stats["rejected"]
         mc1,mc2,mc3 = st.columns(3)
         mc1.metric("Enriched",    enriched)
         mc2.metric("Pending",     stats["new_signal"])
         mc3.metric("Rejected",    stats["rejected"])
-        co_df = load_companies()
-        if not co_df.empty:
-            ind_counts = co_df["Industry"].value_counts().head(5).reset_index()
-            ind_counts.columns = ["Industry", "Count"]
-            st.dataframe(ind_counts, hide_index=True, use_container_width=True, height=120)
 
     st.divider()
     r2c1, r2c2 = st.columns(2)
@@ -449,106 +484,43 @@ if page == "📊 Pipeline Monitor":
         mc1.metric("Qualified", stats["qualified"])
         mc2.metric("Rejected",  stats["rejected"])
         mc3.metric("Pass Rate", f"{round(stats['qualified']/total_scored*100)}%" if total_scored else "—")
-        co_df = load_companies()
-        if not co_df.empty:
-            q_df = co_df[co_df["Status"].isin(["QUALIFIED","CONTACT_FOUND","EMAIL_VERIFIED",
-                                                "RESEARCH_DONE","EMAIL_READY","EMAIL_SENT","REPLIED"])]
-            if not q_df.empty:
-                score_dist = q_df["ICP Score"].describe()[["min","mean","max"]].round(1)
-                sc1,sc2,sc3 = st.columns(3)
-                sc1.metric("Min Score", int(score_dist["min"]))
-                sc2.metric("Avg Score", round(score_dist["mean"],1))
-                sc3.metric("Max Score", int(score_dist["max"]))
 
     with r2c2:
-        module_header("🔍", "Finder + ✅ Verifier", "Finds & verifies decision maker emails", "#9f7aea")
+        module_header("🔍", "Finder + ✅ Verifier", "Decision maker emails (Apify + SMTP)", "#9f7aea")
         mc1,mc2,mc3 = st.columns(3)
         mc1.metric("Contacts Found",    stats["contacts_found"])
-        mc2.metric("Emails Verified",   stats["contacts_verified"])
-        invalid = stats["contacts_found"] - stats["contacts_verified"]
-        mc3.metric("Invalid/Pending",   invalid)
-        ct_df = load_contacts()
-        if not ct_df.empty:
-            role_counts = ct_df["Role"].value_counts().head(5).reset_index()
-            role_counts.columns = ["Role", "Count"]
-            st.dataframe(role_counts, hide_index=True, use_container_width=True, height=120)
-        else:
-            st.info("No contacts found yet.")
+        mc2.metric("✅ Verified",       stats["contacts_verified"])
+        mc3.metric("⚠️ Guessed",       stats["contacts_guessed"])
 
     st.divider()
     r3c1, r3c2 = st.columns(2)
 
     with r3c1:
-        module_header("📚", "Research", "Deep LLM research: pain points, tech stack, hooks", "#63b3ed")
+        module_header("📚", "Research", "Pain points, tech stack, personalization", "#63b3ed")
         mc1,mc2 = st.columns(2)
-        mc1.metric("Companies Researched", stats["research_done"])
-        mc2.metric("Awaiting Research",    max(0, stats["qualified"] - stats["research_done"]))
-        res_df = load_research()
-        if not res_df.empty:
-            st.dataframe(res_df[["Company","Industry","Pain Points"]].head(4),
-                         hide_index=True, use_container_width=True, height=130)
-        else:
-            st.info("No research done yet.")
+        mc1.metric("Researched", stats["research_done"])
+        mc2.metric("Awaiting",   max(0, stats["qualified"] - stats["research_done"]))
 
     with r3c2:
-        module_header("✍️", "Email Writer", "Personalised multi-touch email sequences", "#ecc94b")
+        module_header("✍️", "Email Writer + 📤 Sender", "Multi-touch email sequences", "#ecc94b")
         mc1,mc2,mc3 = st.columns(3)
-        mc1.metric("Drafts",     stats["emails_draft"])
-        mc2.metric("Scheduled",  stats["emails_scheduled"])
-        mc3.metric("Sent",       stats["emails_sent"])
-        em_df = load_emails()
-        if not em_df.empty:
-            seq_counts = em_df["Seq"].value_counts().sort_index().reset_index()
-            seq_counts.columns = ["Sequence", "Count"]
-            seq_counts["Sequence"] = seq_counts["Sequence"].map(
-                {0:"Initial",1:"Follow-up 1",2:"Follow-up 2"}).fillna("Other")
-            st.dataframe(seq_counts, hide_index=True, use_container_width=True, height=120)
-        else:
-            st.info("No emails written yet.")
-
-    st.divider()
-    r4c1, r4c2 = st.columns(2)
-
-    with r4c1:
-        module_header("📤", "Sender", "Schedules and delivers emails via SMTP", "#667eea")
-        mc1,mc2,mc3 = st.columns(3)
-        mc1.metric("Emails Sent",    stats["emails_sent"])
-        mc2.metric("Scheduled",      stats["emails_scheduled"])
-        mc3.metric("Reply Rate",     f"{stats['reply_rate']}%")
-        em_df = load_emails()
-        sent = em_df[em_df["Status"]=="SENT"] if not em_df.empty else pd.DataFrame()
-        if not sent.empty:
-            st.dataframe(sent[["Company","To","Subject","Sent"]].head(4),
-                         hide_index=True, use_container_width=True, height=130)
-        else:
-            st.info("No emails sent yet.")
-
-    with r4c2:
-        module_header("💬", "Reply Checker", "Monitors inbox for replies via IMAP", "#48bb78")
-        mc1,mc2 = st.columns(2)
-        mc1.metric("Replies Detected", stats["replies"])
-        mc2.metric("Reply Rate",       f"{stats['reply_rate']}%")
-        rep_df = load_replies()
-        if not rep_df.empty:
-            st.dataframe(rep_df[["Company","From","Subject","Detected"]].head(4),
-                         hide_index=True, use_container_width=True, height=130)
-        else:
-            st.info("No replies yet — replies will appear here automatically.")
+        mc1.metric("Scheduled", stats["emails_scheduled"])
+        mc2.metric("Sent",      stats["emails_sent"])
+        mc3.metric("Reply Rate", f"{stats['reply_rate']}%")
 
 
 # ══════════════════════════════════════════════════════
-# 2. WATCHER — SIGNALS
+# 2. WATCHER — SIGNALS (Detailed)
 # ══════════════════════════════════════════════════════
 elif page == "📡 Watcher — Signals":
-    module_header("📡", "Watcher", "Stage 1 — Collects buying signals from all sources", "#f59e0b")
-    st.caption("Data stored in: `signals` table  |  Fields: company, signal_type, source, title, url, detected_at")
+    module_header("📡", "Watcher", "Stage 1 — LinkedIn QA job signals (USA)", "#f59e0b")
+    st.caption("Data: `signals` table  |  Source: LinkedIn  |  Focus: QA roles, USA")
 
     stats = load_stats()
-    c1,c2,c3,c4 = st.columns(4)
+    c1,c2,c3 = st.columns(3)
     c1.metric("Total Signals",  stats["total_signals"])
-    c2.metric("Sources Active", len(stats.get("signal_sources", {})))
-    c3.metric("Upwork",         stats["upwork_signals"])
-    c4.metric("Companies Found",stats["total_companies"])
+    c2.metric("LinkedIn",       stats["linkedin_signals"])
+    c3.metric("Companies Found",stats["total_companies"])
 
     st.divider()
     df = load_signals()
@@ -569,25 +541,44 @@ elif page == "📡 Watcher — Signals":
         st.dataframe(filtered, use_container_width=True, hide_index=True)
         st.caption(f"Showing {len(filtered)} / {len(df)} signals")
 
-        # Upwork drill-down
-        upwork_df = filtered[filtered["Source"] == "upwork"]
-        if not upwork_df.empty:
-            st.divider()
-            st.subheader(f"🟢 Upwork Job Listings ({len(upwork_df)})")
-            with st.expander("View Upwork listings", expanded=True):
-                for _, row in upwork_df.iterrows():
+        # ── Detailed Signal Cards ──
+        st.divider()
+        st.subheader("📋 Signal Details")
+
+        for source_name in src_sel:
+            source_df = filtered[filtered["Source"] == source_name]
+            if source_df.empty:
+                continue
+
+            color = SOURCE_COLOR.get(source_name, "#718096")
+            st.markdown(
+                f'<div style="background:{color}18;border:1px solid {color}55;border-radius:8px;'
+                f'padding:8px 14px;margin:8px 0;">'
+                f'<span style="color:{color};font-weight:700;font-size:1rem;">'
+                f'🔵 {source_name.title()} ({len(source_df)} signals)</span></div>',
+                unsafe_allow_html=True
+            )
+
+            with st.expander(f"View all {source_name.title()} listings", expanded=False):
+                for _, row in source_df.iterrows():
                     st.markdown(f"**{row['Company']}** — {row['Title']}")
-                    if row["URL"]:
-                        st.markdown(f"🔗 [{row['URL']}]({row['URL']})")
+                    if row.get("Description"):
+                        st.caption(row["Description"][:150])
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        if row["URL"]:
+                            st.markdown(f"🔗 [{row['URL'][:60]}...]({row['URL']})")
+                    with col_b:
+                        st.caption(f"Status: {row['Status']}")
                     st.markdown("---")
 
 
 # ══════════════════════════════════════════════════════
-# 3. ENRICHMENT — COMPANIES
+# 3. COMPANIES (Enriched from LinkedIn)
 # ══════════════════════════════════════════════════════
-elif page == "🔬 Enrichment — Companies":
-    module_header("🔬", "Enrichment", "Stage 2 — LLM classifies industry, country, employee count", "#4299e1")
-    st.caption("Data stored in: `companies` table  |  Fields: industry, country, employee_count, website, linkedin_url, github_url")
+elif page == "🏢 Companies":
+    module_header("🏢", "Companies", "Enriched directly from LinkedIn data — no separate enrichment needed", "#4299e1")
+    st.caption("Data: `companies` table  |  All enrichment data (website, industry, employees, LinkedIn URL) comes from LinkedIn job scraper")
 
     df = load_companies()
     if df.empty:
@@ -621,26 +612,51 @@ elif page == "🔬 Enrichment — Companies":
         st.dataframe(filtered, use_container_width=True, hide_index=True)
         st.caption(f"{len(filtered)} companies shown")
 
+        # ── Detailed Company Cards ──
+        st.divider()
+        st.subheader("🏢 Company Details")
+
+        company_sel = st.selectbox("Select a company to view details", filtered["Name"].tolist() if not filtered.empty else [])
+        if company_sel:
+            row = filtered[filtered["Name"] == company_sel].iloc[0]
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**Company:** {row['Name']}")
+                st.markdown(f"**Industry:** {row['Industry'] or '—'}")
+                st.markdown(f"**Country:** {row['Country'] or '—'}")
+                st.markdown(f"**Employees:** {row['Employees'] or '—'}")
+            with col2:
+                st.markdown(f"**Status:** {status_pill(row['Status'])}", unsafe_allow_html=True)
+                st.markdown(f"**ICP Score:** {row['ICP Score']}")
+                if row["Website"]:
+                    st.markdown(f"**Website:** [{row['Website']}]({row['Website']})")
+                if row["LinkedIn"]:
+                    st.markdown(f"**LinkedIn:** [{row['LinkedIn']}]({row['LinkedIn']})")
+                if row["GitHub"]:
+                    st.markdown(f"**GitHub:** [{row['GitHub']}]({row['GitHub']})")
+
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Top Industries")
-            ind_counts = df["Industry"].value_counts().head(8).reset_index()
-            ind_counts.columns = ["Industry", "Count"]
-            st.bar_chart(ind_counts.set_index("Industry"))
+            ind_counts = df[df["Industry"] != ""]["Industry"].value_counts().head(8).reset_index()
+            if not ind_counts.empty:
+                ind_counts.columns = ["Industry", "Count"]
+                st.bar_chart(ind_counts.set_index("Industry"))
         with col2:
             st.subheader("Top Countries")
-            co_counts = df["Country"].value_counts().head(8).reset_index()
-            co_counts.columns = ["Country", "Count"]
-            st.bar_chart(co_counts.set_index("Country"))
+            co_counts = df[df["Country"] != ""]["Country"].value_counts().head(8).reset_index()
+            if not co_counts.empty:
+                co_counts.columns = ["Country", "Count"]
+                st.bar_chart(co_counts.set_index("Country"))
 
 
 # ══════════════════════════════════════════════════════
-# 4. SCORER — QUALIFICATION
+# 4. SCORER — QUALIFICATION (Detailed)
 # ══════════════════════════════════════════════════════
 elif page == "🎯 Scorer — Qualification":
     module_header("🎯", "Scorer", "Stage 3 — ICP rule-based scoring, qualifies or rejects companies", "#48bb78")
-    st.caption("Data stored in: `companies` table  |  Fields: icp_score, status (QUALIFIED / REJECTED)")
+    st.caption("Data: `companies` table  |  Fields: icp_score, status (QUALIFIED / REJECTED)")
 
     df = load_companies()
     scored = df[df["Status"].isin(["QUALIFIED","REJECTED","CONTACT_FOUND","EMAIL_VERIFIED",
@@ -664,10 +680,27 @@ elif page == "🎯 Scorer — Qualification":
 
         with tab_q:
             st.dataframe(
-                qualified[["Name","Industry","Country","Employees","ICP Score","Status"]]
+                qualified[["Name","Industry","Country","Employees","ICP Score","Status","Website"]]
                 .sort_values("ICP Score", ascending=False),
                 use_container_width=True, hide_index=True
             )
+
+            # Detailed view for qualified companies
+            if not qualified.empty:
+                st.divider()
+                st.subheader("📋 Qualified Company Details")
+                q_sel = st.selectbox("Select company", qualified["Name"].tolist(), key="q_detail")
+                if q_sel:
+                    row = qualified[qualified["Name"] == q_sel].iloc[0]
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"**Industry:** {row['Industry']}")
+                        st.markdown(f"**Country:** {row['Country']}")
+                        st.markdown(f"**Employees:** {row['Employees']}")
+                    with col2:
+                        st.markdown(f"**ICP Score:** {row['ICP Score']}")
+                        st.markdown(f"**Website:** {row['Website'] or '—'}")
+                        st.markdown(f"**Current Status:** {status_pill(row['Status'])}", unsafe_allow_html=True)
 
         with tab_r:
             st.dataframe(
@@ -689,11 +722,11 @@ elif page == "🎯 Scorer — Qualification":
 
 
 # ══════════════════════════════════════════════════════
-# 5. FINDER + VERIFIER — CONTACTS
+# 5. FINDER + VERIFIER — CONTACTS (Detailed)
 # ══════════════════════════════════════════════════════
 elif page == "🔍 Finder & ✅ Verifier — Contacts":
-    module_header("🔍", "Finder + Verifier", "Stages 4 & 5 — Finds decision maker contacts, verifies email deliverability", "#9f7aea")
-    st.caption("Data stored in: `contacts` table  |  Fields: name, role, email, linkedin_url, verified")
+    module_header("🔍", "Finder + Verifier", "Stages 4 & 5 — Finds decision makers, verifies via Apify or SMTP", "#9f7aea")
+    st.caption("Data: `contacts` table  |  Email sources: APIFY_VERIFIED, GUESSED, PATTERN_DERIVED")
 
     df = load_contacts()
     if df.empty:
@@ -701,26 +734,47 @@ elif page == "🔍 Finder & ✅ Verifier — Contacts":
     else:
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Total Contacts",  len(df))
-        c2.metric("✅ Verified",     len(df[df["Verified"]=="VALID"]))
-        c3.metric("❌ Invalid",      len(df[df["Verified"]=="INVALID"]))
-        c4.metric("⏳ Pending",      len(df[df["Verified"]=="PENDING"]))
+        c2.metric("✅ Verified",     len(df[df["Verified"].isin(["VALID", "APIFY_VERIFIED"])]))
+        c3.metric("⚠️ Guessed",     len(df[df["Verified"]=="GUESSED"]))
+        c4.metric("❌ Invalid",      len(df[df["Verified"]=="INVALID"]))
 
         st.divider()
 
-        ver_sel = st.multiselect("Filter by Verification",
-                                 ["VALID","INVALID","PENDING"],
-                                 default=["VALID","INVALID","PENDING"])
-        filtered = df[df["Verified"].isin(ver_sel)]
+        # Email source breakdown
+        st.subheader("📧 Email Source Breakdown")
+        if "Email Source" in df.columns:
+            source_counts = df["Email Source"].value_counts().reset_index()
+            source_counts.columns = ["Source", "Count"]
+            for _, row in source_counts.iterrows():
+                st.markdown(f"{email_source_badge(row['Source'])} — **{row['Count']}** contacts", unsafe_allow_html=True)
+        st.write("")
 
-        # Colour-code Verified column
-        def color_verified(val):
-            colors = {"VALID": "color:#48bb78;font-weight:600",
-                      "INVALID": "color:#fc8181;font-weight:600",
-                      "PENDING": "color:#ecc94b;font-weight:600"}
-            return colors.get(val, "")
+        st.divider()
+        ver_sel = st.multiselect("Filter by Verification Status",
+                                 df["Verified"].unique().tolist(),
+                                 default=df["Verified"].unique().tolist())
+        filtered = df[df["Verified"].isin(ver_sel)]
 
         st.dataframe(filtered, use_container_width=True, hide_index=True)
         st.caption(f"{len(filtered)} contacts shown")
+
+        # ── Detailed Contact Cards ──
+        st.divider()
+        st.subheader("👤 Contact Details")
+        for _, row in filtered.iterrows():
+            with st.expander(f"**{row['Name']}** — {row['Role']} at {row['Company']}"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**Name:** {row['Name']}")
+                    st.markdown(f"**Role:** {row['Role']}")
+                    st.markdown(f"**Email:** `{row['Email']}`")
+                    st.markdown(f"**Email Source:** {email_source_badge(row['Email Source'])}", unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f"**Company:** {row['Company']}")
+                    st.markdown(f"**Company Status:** {status_pill(row['Co. Status'])}", unsafe_allow_html=True)
+                    st.markdown(f"**Verified:** {row['Verified']}")
+                    if row["LinkedIn"]:
+                        st.markdown(f"**LinkedIn:** [{row['LinkedIn']}]({row['LinkedIn']})")
 
         st.divider()
         col1, col2 = st.columns(2)
@@ -737,47 +791,65 @@ elif page == "🔍 Finder & ✅ Verifier — Contacts":
 
 
 # ══════════════════════════════════════════════════════
-# 6. RESEARCH — INTELLIGENCE
+# 6. RESEARCH — INTELLIGENCE (Detailed)
 # ══════════════════════════════════════════════════════
 elif page == "📚 Research — Intelligence":
-    module_header("📚", "Research", "Stage 6 — Deep LLM research: summaries, pain points, tech stack, personalization hooks", "#63b3ed")
-    st.caption("Data stored in: `research` table  |  Fields: summary, pain_points, tech_stack, recent_news, raw_json")
+    module_header("📚", "Research", "Stage 6 — Deep LLM research: summaries, pain points, tech stack, talking points", "#63b3ed")
+    st.caption("Data: `research` table  |  Fields: summary, pain_points, tech_stack, recent_news, talking_points, urgency")
 
     df = load_research()
     if df.empty:
         st.info("No research done yet. Run `python research.py`")
     else:
-        c1,c2 = st.columns(2)
+        c1,c2,c3 = st.columns(3)
         c1.metric("Companies Researched", len(df))
         c2.metric("With Tech Stack",      len(df[df["Tech Stack"] != ""]))
+        c3.metric("High Urgency",         len(df[df["Urgency"] == "high"]) if "Urgency" in df.columns else 0)
 
         st.divider()
-        st.dataframe(df[["Company","Industry","Country","Pain Points","Tech Stack"]],
+        st.dataframe(df[["Company","Industry","Country","Summary","Pain Points","Tech Stack","Urgency"]],
                      use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("🔍 Deep Dive per Company")
         company_sel = st.selectbox("Select company", df["Company"].tolist())
         row = df[df["Company"] == company_sel].iloc[0]
+
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown(f"**📋 Summary**")
-            st.write(row["Summary"] or "—")
-            st.markdown(f"**🔧 Tech Stack**")
-            st.write(row["Tech Stack"] or "—")
+            st.markdown("**📋 Summary**")
+            st.info(row["Summary"] or "—")
+            st.markdown("**🔧 Tech Stack**")
+            if row["Tech Stack"]:
+                for tech in row["Tech Stack"].split(", "):
+                    st.markdown(f"  • {tech}")
+            else:
+                st.write("—")
         with col2:
-            st.markdown(f"**😤 Pain Points**")
-            st.write(row["Pain Points"] or "—")
-            st.markdown(f"**📰 Recent News**")
+            st.markdown("**😤 Pain Points**")
+            if row["Pain Points"]:
+                for pp in row["Pain Points"].split(", "):
+                    st.markdown(f"  • {pp}")
+            else:
+                st.write("—")
+            st.markdown("**📰 Recent News**")
             st.write(row["Recent News"] or "—")
+            if row.get("Talking Points"):
+                st.markdown("**💬 Talking Points**")
+                for tp in row["Talking Points"].split(", "):
+                    st.markdown(f"  • {tp}")
+            if row.get("Urgency"):
+                urgency_color = {"high": "#fc8181", "medium": "#f6e05e", "low": "#68d391"}.get(row["Urgency"], "#a0aec0")
+                st.markdown(f'**Urgency:** <span style="color:{urgency_color};font-weight:700;">{row["Urgency"].upper()}</span>',
+                           unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════
-# 7. EMAIL WRITER — DRAFTS
+# 7. EMAIL WRITER — DRAFTS (Editable)
 # ══════════════════════════════════════════════════════
 elif page == "✍️ Email Writer — Drafts":
-    module_header("✍️", "Email Writer", "Stage 7 — Generates personalised multi-touch email sequences", "#ecc94b")
-    st.caption("Data stored in: `emails` table  |  Fields: subject, body, sequence_number, status, scheduled_at")
+    module_header("✍️", "Email Writer", "Stage 7 — Generates & edits personalised email sequences", "#ecc94b")
+    st.caption("Data: `emails` table  |  ✏️ Edit subject/body before sending  |  Changes saved to DB")
 
     df = load_emails()
     if df.empty:
@@ -791,31 +863,84 @@ elif page == "✍️ Email Writer — Drafts":
 
         st.divider()
 
-        status_sel = st.multiselect("Status", df["Status"].unique().tolist(),
+        status_sel = st.multiselect("Status Filter", df["Status"].unique().tolist(),
                                     default=df["Status"].unique().tolist())
         filtered = df[df["Status"].isin(status_sel)]
-        st.dataframe(filtered[["Company","To","Subject","Seq","Status","Scheduled","Sent"]],
+        st.dataframe(filtered[["Company","Contact","To","Subject","Seq","Status","Scheduled","Sent"]],
                      use_container_width=True, hide_index=True)
 
         st.divider()
-        st.subheader("📨 Full Email Preview")
+        st.subheader("📨 Email Preview & Editor")
+
         if not filtered.empty:
-            sel_idx = st.selectbox("Select email",
-                                   [f"{r['Company']} — {r['Subject']} (Seq {r['Seq']})"
-                                    for _, r in filtered.iterrows()])
-            idx = [f"{r['Company']} — {r['Subject']} (Seq {r['Seq']})"
-                   for _, r in filtered.iterrows()].index(sel_idx)
-            row = filtered.iloc[idx]
-            st.markdown(f"**To:** {row['To']}  |  **Subject:** {row['Subject']}  |  **Status:** {row['Status']}")
-            st.text_area("Body", value=row["Body"], height=200, disabled=True)
+            # Group emails by company for easier browsing
+            company_list = filtered["Company"].unique().tolist()
+            sel_company = st.selectbox("Select company", company_list, key="email_company")
+            company_emails = filtered[filtered["Company"] == sel_company]
+
+            for _, row in company_emails.iterrows():
+                seq_label = {0: "Initial Email", 1: "Follow-up 1", 2: "Follow-up 2"}.get(row["Seq"], f"Email #{row['Seq']}")
+                status_icon = {"SCHEDULED": "📅", "SENT": "✅", "DRAFT": "📝", "FAILED": "❌", "CANCELLED": "🚫"}.get(row["Status"], "📧")
+
+                with st.expander(f"{status_icon} {seq_label} — {row['Subject']} [{row['Status']}]", expanded=(row["Seq"] == 0)):
+                    st.markdown(f"**To:** {row['To']}  |  **Status:** {status_pill(row['Status'])}", unsafe_allow_html=True)
+
+                    # Editable fields — only for SCHEDULED or DRAFT emails
+                    can_edit = row["Status"] in ("SCHEDULED", "DRAFT")
+
+                    new_subject = st.text_input(
+                        "Subject",
+                        value=row["Subject"],
+                        key=f"subj_{row['ID']}",
+                        disabled=not can_edit
+                    )
+
+                    new_body = st.text_area(
+                        "Body",
+                        value=row["Body"],
+                        height=200,
+                        key=f"body_{row['ID']}",
+                        disabled=not can_edit
+                    )
+
+                    if can_edit:
+                        col_save, col_cancel = st.columns([1, 3])
+                        with col_save:
+                            if st.button("💾 Save Changes", key=f"save_{row['ID']}"):
+                                try:
+                                    with get_session() as session:
+                                        email_record = session.query(Email).filter_by(id=row["ID"]).first()
+                                        if email_record:
+                                            email_record.subject = new_subject
+                                            email_record.body = new_body
+                                    st.success("Saved!")
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Save failed: {e}")
+                        with col_cancel:
+                            if row["Status"] == "SCHEDULED":
+                                if st.button("🚫 Cancel Email", key=f"cancel_{row['ID']}"):
+                                    try:
+                                        with get_session() as session:
+                                            email_record = session.query(Email).filter_by(id=row["ID"]).first()
+                                            if email_record:
+                                                email_record.status = "CANCELLED"
+                                        st.success("Email cancelled!")
+                                        st.cache_data.clear()
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Cancel failed: {e}")
+                    elif row["Status"] == "SENT":
+                        st.caption(f"📤 Sent at: {row['Sent']}")
 
 
 # ══════════════════════════════════════════════════════
-# 8. SENDER — SENT EMAILS
+# 8. SENDER — SENT EMAILS (Detailed)
 # ══════════════════════════════════════════════════════
 elif page == "📤 Sender — Sent Emails":
     module_header("📤", "Sender", "Stage 8 — Delivers scheduled emails via SMTP", "#667eea")
-    st.caption("Data stored in: `emails` table  |  Fields: status=SENT, sent_at, message_id")
+    st.caption("Data: `emails` table  |  Status: SENT, sent_at, message_id  |  SMTP SSL (port 465) supported")
 
     df = load_emails()
     sent = df[df["Status"]=="SENT"] if not df.empty else pd.DataFrame()
@@ -830,27 +955,42 @@ elif page == "📤 Sender — Sent Emails":
 
     st.divider()
 
-    tab1, tab2 = st.tabs(["📤 Sent", "📅 Scheduled"])
+    tab1, tab2, tab3 = st.tabs(["📤 Sent", "📅 Scheduled", "❌ Failed"])
     with tab1:
         if sent.empty:
             st.info("No emails sent yet. Run `python sender.py`")
         else:
-            st.dataframe(sent[["Company","To","Subject","Seq","Sent"]],
+            st.dataframe(sent[["Company","Contact","To","Subject","Seq","Sent"]],
                          use_container_width=True, hide_index=True)
+            # Detailed sent email view
+            st.divider()
+            for _, row in sent.iterrows():
+                with st.expander(f"📤 {row['Company']} — {row['Subject']}"):
+                    st.markdown(f"**To:** {row['To']}  |  **Sent:** {row['Sent']}")
+                    st.text_area("Body", value=row["Body"], height=150, disabled=True, key=f"sent_{row['ID']}")
+
     with tab2:
         if scheduled.empty:
             st.info("No emails scheduled yet.")
         else:
-            st.dataframe(scheduled[["Company","To","Subject","Seq","Scheduled"]],
+            st.dataframe(scheduled[["Company","Contact","To","Subject","Seq","Scheduled"]],
+                         use_container_width=True, hide_index=True)
+
+    with tab3:
+        failed = df[df["Status"]=="FAILED"] if not df.empty else pd.DataFrame()
+        if failed.empty:
+            st.info("No failed emails.")
+        else:
+            st.dataframe(failed[["Company","Contact","To","Subject","Seq","Status"]],
                          use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════
-# 9. REPLY CHECKER — REPLIES
+# 9. REPLY CHECKER — REPLIES (Detailed)
 # ══════════════════════════════════════════════════════
 elif page == "💬 Reply Checker — Replies":
     module_header("💬", "Reply Checker", "Stage 9 — Monitors inbox via IMAP and logs replies", "#48bb78")
-    st.caption("Data stored in: `reply_logs` table  |  Fields: reply_from, reply_subject, reply_body, detected_at")
+    st.caption("Data: `reply_logs` table  |  Fields: reply_from, reply_subject, reply_body, detected_at")
 
     stats = load_stats()
     df   = load_replies()
@@ -867,13 +1007,13 @@ elif page == "💬 Reply Checker — Replies":
     else:
         st.dataframe(df[["Company","From","Subject","Detected"]], use_container_width=True, hide_index=True)
         st.divider()
-        st.subheader("Reply Details")
+        st.subheader("📩 Reply Details")
         for _, row in df.iterrows():
             with st.expander(f"📩 {row['Company']} — {row['Subject']}"):
-                st.write(f"**From:** {row['From']}")
-                st.write(f"**Detected:** {row['Detected']}")
+                st.markdown(f"**From:** {row['From']}")
+                st.markdown(f"**Detected:** {row['Detected']}")
                 st.divider()
-                st.write(row["Preview"])
+                st.write(row.get("Body", row.get("Preview", "")))
 
 
 # ══════════════════════════════════════════════════════
@@ -893,25 +1033,26 @@ elif page == "⚙️ Settings":
         st.dataframe(rules_df, use_container_width=True, hide_index=True)
 
     with tab2:
+        st.subheader("Active Signal Sources")
         st.dataframe(pd.DataFrame([
-            {"Source": "Greenhouse",      "Type": "Job Board",           "Signal": "JOB_POSTING",    "Status": "✅ Active"},
-            {"Source": "Lever",           "Type": "Job Board",           "Signal": "JOB_POSTING",    "Status": "✅ Active"},
-            {"Source": "LinkedIn",        "Type": "Job Search",          "Signal": "JOB_POSTING",    "Status": "✅ Active"},
-            {"Source": "Upwork",          "Type": "Freelance Job Board", "Signal": "JOB_POSTING",    "Status": "✅ Active"},
-            {"Source": "Product Hunt",    "Type": "Product Launches",    "Signal": "PRODUCT_LAUNCH", "Status": "✅ Active"},
-            {"Source": "RSS (TechCrunch)","Type": "News Feed",           "Signal": "NEWS",           "Status": "✅ Active"},
+            {"Source": "LinkedIn",  "Type": "Job Search",  "Signal": "JOB_POSTING",  "Focus": "QA roles, USA",  "Status": "✅ Active"},
+        ]), use_container_width=True, hide_index=True)
+
+        st.subheader("Email Finding")
+        st.dataframe(pd.DataFrame([
+            {"Method": "Apify Email Finder",   "Actor": "overpowered/email-finder",  "Priority": "1 (Primary)",    "Status": "✅ Active"},
+            {"Method": "Pattern Guessing",     "Actor": "—",                         "Priority": "2 (Fallback)",   "Status": "✅ Active"},
         ]), use_container_width=True, hide_index=True)
 
     with tab3:
         st.dataframe(pd.DataFrame([
-            {"Module":"watcher",      "Interval":"Every 6 hours", "Description":"Collect signals (Greenhouse, Lever, LinkedIn, Upwork, PH, RSS)"},
-            {"Module":"enrichment",   "Interval":"Every 2 hours", "Description":"LLM enriches industry, country, employee count"},
+            {"Module":"watcher",      "Interval":"Every 6 hours", "Description":"Collect QA job signals from LinkedIn (USA) with full company enrichment"},
             {"Module":"scorer",       "Interval":"Every 2 hours", "Description":"ICP rule-based scoring and qualification"},
-            {"Module":"finder",       "Interval":"Every 4 hours", "Description":"Google search + LLM to find decision maker contacts"},
-            {"Module":"verifier",     "Interval":"Every 4 hours", "Description":"SMTP verification of email deliverability"},
+            {"Module":"finder",       "Interval":"Every 4 hours", "Description":"Google search + LLM + Apify email finder for contacts"},
+            {"Module":"verifier",     "Interval":"Every 4 hours", "Description":"SMTP verification (skips Apify-verified emails)"},
             {"Module":"research",     "Interval":"Every 4 hours", "Description":"Deep LLM research: pain points, tech stack, hooks"},
             {"Module":"email_writer", "Interval":"Every 4 hours", "Description":"Write personalised 3-touch email sequences"},
-            {"Module":"sender",       "Interval":"Every 1 hour",  "Description":"Send scheduled emails via SMTP"},
+            {"Module":"sender",       "Interval":"Every 1 hour",  "Description":"Send scheduled emails via SMTP (SSL port 465)"},
             {"Module":"reply_checker","Interval":"Every 30 min",  "Description":"Check inbox via IMAP for replies"},
         ]), use_container_width=True, hide_index=True)
 
@@ -925,4 +1066,3 @@ elif page == "⚙️ Settings":
         if st.button("🗑️ Clear Cache"):
             st.cache_data.clear()
             st.success("Cleared!")
-
