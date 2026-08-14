@@ -28,7 +28,7 @@ This is a **fully autonomous B2B cold outreach pipeline** built in Python. It mo
 ### Step 1 — Clone the Repository
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/Umar-Zansphere/assignme.git
 cd assignme
 ```
 
