@@ -3,17 +3,13 @@ apify_client.py — Wrapper for Apify actor execution.
 
 Focused on:
   - LinkedIn job scraping (QA roles, USA)
-  - Email finding via overpowered/email-finder
-  - Google search for contact discovery
-  - Website scraping for enrichment
 
 Usage:
-    from apify_client import get_linkedin_job_postings, find_email
+    from apify_client import get_linkedin_job_postings
 """
 
 import time
 import re
-import html
 import httpx
 
 from config import APIFY_API_TOKEN, APIFY_BASE_URL
@@ -30,8 +26,6 @@ class ApifyError(Exception):
 # ── Known Actor IDs ─────────────────────────────────────────
 ACTORS = {
     "linkedin_scraper": "curious_coder/linkedin-jobs-scraper",
-    "email_finder": "overpowered/email-finder",
-    "google_search": "apify/google-search-scraper",
 }
 
 # Default LinkedIn search URLs — QA roles in USA only
@@ -270,163 +264,6 @@ def get_linkedin_job_postings(
         })
 
     log.info(f"LinkedIn returned {len(results)} QA job postings")
-    return results
-
-
-# ── Email Finder (Apify) ─────────────────────────────────
-
-def find_email(first_name: str, last_name: str, domain: str) -> dict:
-    """
-    Find a verified email address using the overpowered/email-finder Apify actor.
-
-    Args:
-        first_name: Person's first name.
-        last_name: Person's last name (surname).
-        domain: Company domain (e.g., 'company.com').
-
-    Returns:
-        dict with keys:
-            - "email": str (found email or "")
-            - "verified": bool (True if Apify confirmed deliverable)
-            - "source": str ("APIFY_VERIFIED" or "NOT_FOUND")
-            - "raw": dict (full actor response)
-    """
-    if not first_name or not last_name or not domain:
-        log.warning(f"find_email: missing inputs — name='{first_name} {last_name}', domain='{domain}'")
-        return {"email": "", "verified": False, "source": "NOT_FOUND", "raw": {}}
-
-    try:
-        items = run_actor(ACTORS["email_finder"], {
-            "name": first_name.strip().lower(),
-            "surname": last_name.strip().lower(),
-            "domain": domain.strip().lower(),
-        }, timeout_secs=120)
-
-        if items and len(items) > 0:
-            result = items[0]
-            email = result.get("email", "") or result.get("Email", "") or ""
-            # Check verification status from actor output
-            is_verified = result.get("verified", False) or result.get("deliverable", False) or bool(email)
-
-            if email:
-                log.info(f"Email finder found: {email} (verified={is_verified})")
-                return {
-                    "email": email,
-                    "verified": is_verified,
-                    "source": "APIFY_VERIFIED" if is_verified else "APIFY_UNVERIFIED",
-                    "raw": result,
-                }
-
-        log.info(f"Email finder: no email found for {first_name} {last_name} @ {domain}")
-        return {"email": "", "verified": False, "source": "NOT_FOUND", "raw": {}}
-
-    except Exception as e:
-        log.error(f"Email finder failed for {first_name} {last_name} @ {domain}: {e}")
-        return {"email": "", "verified": False, "source": "NOT_FOUND", "raw": {}}
-
-
-# ── Website Scraper ───────────────────────────────────────
-
-def _clean_html_text(raw_html: str, max_chars: int = 5000) -> str:
-    """Strip script, style, navigation tags and return clean plain text."""
-    if not raw_html:
-        return ""
-    
-    # Remove script, style, nav, footer, header, svg, noscript
-    cleaned = re.sub(r'<(script|style|nav|footer|header|svg|noscript|iframe)[^>]*>.*?</\1>', ' ', raw_html, flags=re.DOTALL | re.IGNORECASE)
-    # Remove HTML tags
-    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
-    # Unescape HTML entities (&amp;, &quot;, etc.)
-    cleaned = html.unescape(cleaned)
-    # Collapse multiple whitespaces
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned[:max_chars]
-
-
-def scrape_website(url: str) -> str:
-    """
-    Scrape a single webpage and return its text content.
-
-    Prioritizes fast direct HTTP fetching, falling back to Jina reader API.
-    Used by research.py for extracting company info.
-    """
-    if not url:
-        return ""
-
-    if not url.startswith(("http://", "https://")):
-        url = f"https://{url}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    # Step 1: Direct HTTP GET (fast & free)
-    try:
-        with httpx.Client(timeout=10.0, follow_redirects=True, verify=False) as client:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 200 and resp.text:
-                text = _clean_html_text(resp.text)
-                if len(text) >= 100:
-                    log.info(f"Direct scrape succeeded for {url} ({len(text)} chars)")
-                    return text
-    except Exception as e:
-        log.debug(f"Direct scrape failed for {url}: {e}")
-
-    # Step 2: Fallback to Jina Reader API (free, renders JavaScript / handles Cloudflare)
-    try:
-        jina_url = f"https://r.jina.ai/{url}"
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-            resp = client.get(jina_url, headers={"User-Agent": headers["User-Agent"]})
-            if resp.status_code == 200 and resp.text:
-                text = re.sub(r'\s+', ' ', resp.text).strip()[:5000]
-                if len(text) >= 100:
-                    log.info(f"Jina reader scrape succeeded for {url} ({len(text)} chars)")
-                    return text
-    except Exception as e:
-        log.debug(f"Jina reader scrape failed for {url}: {e}")
-
-    return ""
-
-
-# ── Google Search ─────────────────────────────────────────
-
-def search_google(query: str, max_results: int = 5) -> list[dict]:
-    """
-    Search Google via Apify.
-
-    Returns: [{"title": str, "url": str, "description": str}, ...]
-    """
-    try:
-        raw_items = run_actor(ACTORS["google_search"], {
-            "queries": query,
-            "maxPagesPerQuery": 1,
-            "resultsPerPage": max_results,
-        })
-    except Exception as e:
-        log.error(f"Google search failed for '{query}': {e}")
-        return []
-
-    results = []
-    for item in raw_items:
-        # Apify google-search-scraper nests results inside 'organicResults'
-        organic = item.get("organicResults", [])
-        if organic and isinstance(organic, list):
-            for org in organic[:max_results]:
-                results.append({
-                    "title": org.get("title", ""),
-                    "url": org.get("url") or org.get("link", ""),
-                    "description": org.get("description") or org.get("snippet", ""),
-                })
-        else:
-            # Fallback for flat items schema
-            results.append({
-                "title": item.get("title", ""),
-                "url": item.get("url") or item.get("link", ""),
-                "description": item.get("description") or item.get("snippet", ""),
-            })
-
     return results
 
 

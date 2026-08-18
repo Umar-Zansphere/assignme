@@ -1,5 +1,7 @@
 """
-openrouter_client.py — Reusable LLM client via OpenRouter API.
+openrouter_client.py — Reusable LLM client via Ollama (OpenAI-compatible API).
+
+Connects to a self-hosted Ollama instance for all LLM calls.
 
 Usage:
     from openrouter_client import call_llm
@@ -13,31 +15,32 @@ Usage:
 
 import httpx
 
-from config import OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, OPENROUTER_MAX_RETRIES
+from config import LLM_MODEL, LLM_BASE_URL, LLM_API_KEY
 from utils import get_logger, safe_json_loads, retry
 
-log = get_logger("openrouter")
+log = get_logger("llm")
 
 
 class OpenRouterError(Exception):
-    """Raised when OpenRouter API call fails after retries."""
+    """Raised when LLM API call fails after retries."""
     pass
 
 
 @retry(max_attempts=5, base_delay=5.0)
 def _raw_chat(messages: list[dict], model: str) -> str:
     """Send chat completion request and return raw content string."""
-    if not OPENROUTER_API_KEY:
-        raise OpenRouterError("OPENROUTER_API_KEY is not set in .env")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    # Only add Authorization header if an API key is configured
+    # (Ollama doesn't need one, but keeps compatibility with OpenRouter/OpenAI)
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=120.0) as client:
         response = client.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://sales-machine.local",
-            },
+            f"{LLM_BASE_URL}/chat/completions",
+            headers=headers,
             json={
                 "model": model,
                 "messages": messages,
@@ -58,7 +61,7 @@ def call_llm(
     expect_json: bool = True,
 ) -> dict | list | str:
     """
-    Call OpenRouter LLM and return structured response.
+    Call LLM and return structured response.
 
     Args:
         system_prompt: System-level instruction.
@@ -72,7 +75,7 @@ def call_llm(
     Raises:
         OpenRouterError: If API fails or JSON parsing fails after retry.
     """
-    model = model or OPENROUTER_MODEL
+    model = model or LLM_MODEL
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -135,6 +138,6 @@ if __name__ == "__main__":
     # Quick test
     result = call_llm(
         system_prompt="You are a helpful assistant. Respond in JSON only.",
-        user_prompt='Return a JSON object with keys "status" and "message". Set status to "ok" and message to "OpenRouter client is working".',
+        user_prompt='Return a JSON object with keys "status" and "message". Set status to "ok" and message to "LLM client is working".',
     )
     print(result)

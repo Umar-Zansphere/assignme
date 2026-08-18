@@ -9,11 +9,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── OpenRouter ──────────────────────────────────────────────
-OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4")
-OPENROUTER_MAX_RETRIES: int = int(os.getenv("OPENROUTER_MAX_RETRIES", "3"))
-OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+# ── LLM (Ollama / OpenAI-compatible) ───────────────────────
+LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")  # Optional — Ollama doesn't need one
+LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen3:14b")
+LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "http://192.168.1.4:11434/v1")
+
+# ── SearXNG (Search) ───────────────────────────────────────
+SEARXNG_URL: str = os.getenv("SEARXNG_URL", "http://192.168.1.4:8080")
 
 # ── Apify ───────────────────────────────────────────────────
 APIFY_API_TOKEN: str = os.getenv("APIFY_API_TOKEN", "")

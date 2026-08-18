@@ -2,8 +2,8 @@
 finder.py — Stage 4: Decision Maker Finder
 
 Finds CTO / Engineering Manager / Head of Product for qualified companies.
-Uses Apify Google Search to find LinkedIn profiles, then extracts contact info.
-Uses Apify overpowered/email-finder for email discovery (not guessing).
+Uses SearXNG search to find LinkedIn profiles, then extracts contact info.
+Uses custom multi-strategy email finder for email discovery (web scraping + SMTP).
 
 Usage:
     python finder.py
@@ -14,7 +14,8 @@ import sys
 
 from database import get_session, init_db
 from models import Company, Contact
-from apify_client import search_google, find_email
+from search_client import search_google
+from email_finder import find_email
 from openrouter_client import call_llm_with_schema
 from utils import get_logger, extract_domain, guess_email, utcnow
 
@@ -110,8 +111,8 @@ def run(dry_run: bool = False):
                     if not domain or any(d in domain for d in ("techcrunch.com", "producthunt.com", "ycombinator.com", "news", "reuters.com", "bloomberg.com", "upwork.com", "linkedin.com")):
                         domain = f"{company.name.lower().replace(' ', '')}.com"
 
-                    # Step 1: Try Apify email finder (real verification)
-                    log.info(f"  Looking up email via Apify: {first_name} {last_name} @ {domain}")
+                    # Step 1: Try custom email finder (web scraping + SMTP verification)
+                    log.info(f"  Looking up email: {first_name} {last_name} @ {domain}")
                     email_result = find_email(first_name, last_name, domain)
 
                     email_address = ""
@@ -119,11 +120,11 @@ def run(dry_run: bool = False):
                     verified_status = None
 
                     if email_result["email"]:
-                        # Apify found a real email
+                        # Email finder found an email
                         email_address = email_result["email"]
-                        email_source = email_result["source"]  # APIFY_VERIFIED or APIFY_UNVERIFIED
-                        verified_status = "APIFY_VERIFIED" if email_result["verified"] else "APIFY_UNVERIFIED"
-                        log.info(f"  [APIFY] Found email: {email_address} ({email_source})")
+                        email_source = email_result["source"]  # SMTP_VERIFIED, WEB_SCRAPED, etc.
+                        verified_status = email_source if email_result["verified"] else email_source
+                        log.info(f"  [FOUND] Email: {email_address} ({email_source})")
                     else:
                         # Step 2: Fall back to pattern guessing
                         email_guesses = guess_email(first_name, last_name, domain) if domain else []

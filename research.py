@@ -1,7 +1,8 @@
 """
 research.py — Stage 6: Research Agent
 
-Uses OpenRouter LLM to research qualified companies.
+Uses local Ollama LLM to research qualified companies.
+Scrapes company websites via crawl4ai (Playwright) to provide deep context.
 Generates structured summaries, identifies pain points, and tech stack.
 
 Usage:
@@ -15,6 +16,7 @@ import sys
 from database import get_session, init_db
 from models import Company, Signal, Research
 from openrouter_client import call_llm_with_schema
+from web_scraper import scrape_website
 from utils import get_logger, safe_json_dumps, utcnow
 
 log = get_logger("research")
@@ -66,6 +68,16 @@ def run(dry_run: bool = False):
                     for s in signals
                 )
 
+                # Scrape company website for deep LLM context
+                website_content = ""
+                if company.website:
+                    log.info(f"  Scraping website for context: {company.website}")
+                    website_content = scrape_website(company.website)
+                    if website_content:
+                        log.info(f"  Got {len(website_content)} chars of website context")
+                    else:
+                        log.info("  No website content scraped")
+
                 user_prompt = f"""Company: {company.name}
 Website: {company.website or 'Unknown'}
 Industry: {company.industry or 'Unknown'}
@@ -77,7 +89,8 @@ ICP Score: {company.icp_score}
 
 Detected signals:
 {signals_text}
-"""
+
+{f'Company Website Content (scraped):{chr(10)}{website_content[:8000]}' if website_content else ''}"""
 
                 data = call_llm_with_schema(
                     system_prompt=RESEARCH_PROMPT,

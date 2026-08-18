@@ -96,14 +96,16 @@ def run(dry_run: bool = False):
 
     with get_session() as session:
         # Get contacts that need verification
-        # Skip already-verified (APIFY_VERIFIED, VALID, INVALID)
+        # Skip already-verified (APIFY_VERIFIED, SMTP_VERIFIED, WEB_SCRAPED, VALID, INVALID)
         contacts = session.query(Contact).filter(
-            Contact.verified.in_([None, "GUESSED", "APIFY_UNVERIFIED"])
+            Contact.verified.in_([None, "GUESSED", "APIFY_UNVERIFIED", "CATCH_ALL_PATTERN", "PATTERN_UNVERIFIED"])
         ).all()
 
-        # Also count Apify-verified contacts for status update
-        apify_verified = session.query(Contact).filter_by(verified="APIFY_VERIFIED").all()
-        log.info(f"Found {len(contacts)} contacts to verify, {len(apify_verified)} already Apify-verified")
+        # Count already-verified contacts (from Apify or custom email finder)
+        pre_verified = session.query(Contact).filter(
+            Contact.verified.in_(["APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED"])
+        ).all()
+        log.info(f"Found {len(contacts)} contacts to verify, {len(pre_verified)} already pre-verified")
 
         valid_count = 0
         invalid_count = 0
@@ -152,12 +154,12 @@ def run(dry_run: bool = False):
                 .all()
             )
             for company in companies_with_contacts:
-                # Count all usable contacts (APIFY_VERIFIED or VALID)
+                # Count all usable contacts (verified by any method)
                 usable_contacts = (
                     session.query(Contact)
                     .filter(
                         Contact.company_id == company.id,
-                        Contact.verified.in_(["VALID", "APIFY_VERIFIED"])
+                        Contact.verified.in_(["VALID", "APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED"])
                     )
                     .count()
                 )
@@ -166,7 +168,7 @@ def run(dry_run: bool = False):
                     company.updated_at = utcnow()
                     log.info(f"  Company '{company.name}' → EMAIL_VERIFIED ({usable_contacts} valid contacts)")
 
-        log.info(f"Verification complete: {valid_count} valid, {invalid_count} invalid, {len(apify_verified)} apify-verified (skipped)")
+        log.info(f"Verification complete: {valid_count} valid, {invalid_count} invalid, {len(pre_verified)} pre-verified (skipped)")
 
 
 if __name__ == "__main__":
