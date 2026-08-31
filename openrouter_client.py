@@ -32,8 +32,7 @@ def _raw_chat(messages: list[dict], model: str) -> str:
     headers = {
         "Content-Type": "application/json",
     }
-    # Only add Authorization header if an API key is configured
-    # (Ollama doesn't need one, but keeps compatibility with OpenRouter/OpenAI)
+
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 

@@ -12,14 +12,26 @@ load_dotenv()
 # ── LLM (Ollama / OpenAI-compatible) ───────────────────────
 LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")  # Optional — Ollama doesn't need one
 LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen3:14b")
-LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "http://192.168.1.4:11434/v1")
+LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "http://192.168.29.65:11434/v1")
 
-# ── SearXNG (Search) ───────────────────────────────────────
-SEARXNG_URL: str = os.getenv("SEARXNG_URL", "http://192.168.1.4:8080")
+# ── Search (multi-provider with fallback) ─────────────────
+# Priority order — first to succeed wins. Comma-separated.
+# Options: searxng, serper, apify
+SEARCH_PROVIDERS: str = os.getenv("SEARCH_PROVIDERS", "searxng,serper,apify")
+
+# SearXNG — self-hosted metasearch (free)
+SEARXNG_URL: str = os.getenv("SEARXNG_URL", "http://192.168.29.65:8080")
+
+# Serper.dev — $0.001/query, very reliable (get key at serper.dev)
+SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")
 
 # ── Apify ───────────────────────────────────────────────────
 APIFY_API_TOKEN: str = os.getenv("APIFY_API_TOKEN", "")
 APIFY_BASE_URL: str = "https://api.apify.com/v2"
+
+# ── Prospeo (Email Finding & Verification) ─────────────────
+PROSPEO_API_KEY: str = os.getenv("PROSPEO_API_KEY", "")
+PROSPEO_BASE_URL: str = "https://api.prospeo.io"
 
 # ── SMTP (Sending) ─────────────────────────────────────────
 SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.gmail.com")

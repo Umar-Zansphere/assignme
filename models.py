@@ -191,3 +191,21 @@ class Setting(Base):
 
     def __repr__(self):
         return f"<Setting(key='{self.key}', value='{self.value}')>"
+
+
+# ── Email Patterns (Domain Pattern Cache) ─────────────────
+class EmailPattern(Base):
+    __tablename__ = "email_patterns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    domain = Column(String, unique=True, nullable=False, index=True)
+    pattern = Column(String, nullable=False)        # "first.last", "flast", "first", etc.
+    confidence = Column(Integer, default=1)          # how many confirmed emails matched this
+    catch_all = Column(String, default="UNKNOWN")   # YES, NO, UNKNOWN
+    sample_email = Column(String)                    # e.g. "john.doe@acme.com" — for reference
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    def __repr__(self):
+        return f"<EmailPattern(domain='{self.domain}', pattern='{self.pattern}', confidence={self.confidence})>"
+

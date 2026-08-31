@@ -14,12 +14,41 @@ Usage:
     python watcher.py
     python watcher.py --dry-run
 """
+import re
 import sys
 from database import get_session, init_db
 from models import Company, Signal, Contact
 from apify_client import get_linkedin_job_postings
 from utils import get_logger
 log = get_logger("watcher")
+
+# Legal suffixes to strip for deduplication
+_LEGAL_SUFFIX_RE = re.compile(
+    r"[,.]?\s*(Inc\.?|LLC\.?|Ltd\.?|Limited|Corp\.?|Corporation|\(.*?\)|GmbH|S\.A\.|B\.V\.|A\.G\.|PLC|LP|LLP)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_company_name(name: str) -> str:
+    """
+    Normalize a company name for deduplication.
+
+    Strips legal suffixes, trailing punctuation, and collapses whitespace.
+
+    Examples:
+        "Stripe, Inc."   → "Stripe"
+        "Stripe Inc"     → "Stripe"
+        "Acme Corp."     → "Acme"
+        "OpenAI, LLC"    → "OpenAI"
+    """
+    name = name.strip()
+    # Repeatedly strip to handle things like "Corp, Inc."
+    for _ in range(3):
+        cleaned = _LEGAL_SUFFIX_RE.sub("", name).strip().rstrip(".,;")
+        if cleaned == name:
+            break
+        name = cleaned
+    return name.strip()
 
 
 def run(dry_run: bool = False):
@@ -53,8 +82,14 @@ def run(dry_run: bool = False):
 
     with get_session() as session:
         for signal_data in all_signals:
-            company_name = signal_data.get("company", "").strip()
-            if not company_name or company_name.lower() in ("unknown", "n/a", "none", "null", "undefined") or len(company_name) < 2:
+            raw_name = signal_data.get("company", "").strip()
+            if not raw_name or raw_name.lower() in ("unknown", "n/a", "none", "null", "undefined") or len(raw_name) < 2:
+                skipped += 1
+                continue
+
+            # Normalize name to prevent "Stripe Inc" vs "Stripe, Inc." duplicates
+            company_name = _normalize_company_name(raw_name)
+            if len(company_name) < 2:
                 skipped += 1
                 continue
 

@@ -1,19 +1,33 @@
 """
-verifier.py — Stage 5: Email Verification
+verifier.py — Stage 5: Email Verification (Simplified)
 
-Verifies contact email addresses using SMTP MX lookup + RCPT TO check.
-Skips re-verification for emails already verified by Apify email finder.
-Marks contacts as VALID, INVALID, or keeps APIFY_VERIFIED.
+With Prospeo handling email finding + verification, this stage is now
+a lightweight gate that:
+
+  1. Trusts Prospeo-sourced contacts (PROSPEO_VERIFIED, PROSPEO_CATCH_ALL)
+  2. Runs basic sanity checks (format + MX record) on any other sources
+  3. Advances companies to EMAIL_VERIFIED status
+
+Verification tiers:
+  PROSPEO_VERIFIED  — Prospeo found and verified the email (high confidence)
+  PROSPEO_CATCH_ALL — Prospeo found the email but domain is catch-all (medium)
+  PATTERN_ACCEPTED  — Format valid + MX record exists (basic sanity)
+  INVALID           — Bad format, no MX record, or no email at all
 
 Usage:
     python verifier.py
     python verifier.py --dry-run
 """
 
+import re
 import sys
 import socket
-import smtplib
-import dns.resolver  # pip install dnspython — added as optional; falls back to basic check
+
+try:
+    import dns.resolver
+    _HAS_DNS = True
+except ImportError:
+    _HAS_DNS = False
 
 from database import get_session, init_db
 from models import Company, Contact
@@ -21,67 +35,37 @@ from utils import get_logger, utcnow
 
 log = get_logger("verifier")
 
+# Statuses from Prospeo that are already verified — skip re-verification
+_ALREADY_VERIFIED = {
+    "PROSPEO_VERIFIED", "PROSPEO_CATCH_ALL",
+    "APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED",
+}
+# All statuses that can proceed to email writing
+_USABLE = _ALREADY_VERIFIED | {"VALID", "PATTERN_ACCEPTED"}
 
-def verify_email_smtp(email: str, timeout: int = 10) -> bool:
-    """
-    Verify an email address via SMTP conversation.
-
-    Steps:
-        1. Extract domain
-        2. Look up MX records
-        3. Connect to mail server
-        4. Send RCPT TO and check response
-
-    Returns True if the email appears to be valid.
-
-    Note: Many servers block this technique. False negatives are common.
-    For production, use a proper verification API (ZeroBounce, NeverBounce, etc.)
-    """
-    if not email or "@" not in email:
-        return False
-
-    domain = email.split("@")[1]
-
-    # Resolve MX records
-    try:
-        mx_records = dns.resolver.resolve(domain, "MX")
-        mx_host = str(sorted(mx_records, key=lambda r: r.preference)[0].exchange).rstrip(".")
-    except Exception:
-        # Fallback: try the domain itself
-        mx_host = domain
-
-    try:
-        with smtplib.SMTP(mx_host, 25, timeout=timeout) as server:
-            server.ehlo("verify.local")
-            server.mail("verify@verify.local")
-            code, _ = server.rcpt(email)
-            return code == 250
-    except (smtplib.SMTPException, socket.error, OSError) as e:
-        log.debug(f"SMTP verification failed for {email}: {e}")
-        return False
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def verify_email_basic(email: str) -> bool:
-    """
-    Basic email validation — checks format and MX record exists.
+def _format_ok(email: str) -> bool:
+    """Basic regex format check."""
+    return bool(email and _EMAIL_RE.match(email.strip()))
 
-    Fallback when dnspython is not installed or SMTP check fails.
-    """
-    if not email or "@" not in email:
-        return False
 
-    parts = email.split("@")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        return False
-
-    domain = parts[1]
-
-    # Check if domain has MX records
-    try:
-        dns.resolver.resolve(domain, "MX")
-        return True
-    except Exception:
-        # Try A record as fallback
+def _mx_exists(domain: str) -> bool:
+    """Return True if the domain has at least one MX or A record."""
+    if _HAS_DNS:
+        try:
+            dns.resolver.resolve(domain, "MX")
+            return True
+        except Exception:
+            pass
+        try:
+            dns.resolver.resolve(domain, "A")
+            return True
+        except Exception:
+            return False
+    else:
+        # Fallback: plain socket lookup
         try:
             socket.getaddrinfo(domain, 25)
             return True
@@ -89,27 +73,56 @@ def verify_email_basic(email: str) -> bool:
             return False
 
 
+def verify_contact(email: str) -> str:
+    """
+    Run basic verification checks on an email address.
+
+    This is only called for contacts NOT sourced from Prospeo.
+    Prospeo-sourced contacts are trusted without re-verification.
+
+    Decision tree:
+      1. Bad format                  → INVALID
+      2. Domain has no MX / A record → INVALID
+      3. Format OK + MX exists       → PATTERN_ACCEPTED (proceed with caution)
+    """
+    email = (email or "").strip().lower()
+
+    if not _format_ok(email):
+        return "INVALID"
+
+    domain = email.split("@")[1]
+    if not _mx_exists(domain):
+        log.debug(f"No MX/A record for domain '{domain}' — INVALID")
+        return "INVALID"
+
+    # Domain is real, format is valid — accept with medium confidence
+    return "PATTERN_ACCEPTED"
+
+
 def run(dry_run: bool = False):
-    """Verify all unverified contacts. Skip Apify-verified ones."""
+    """Verify all unverified contacts using tiered trust model."""
     init_db()
-    log.info("Starting email verification...")
+    log.info("Starting email verification (Prospeo trust model)...")
 
     with get_session() as session:
-        # Get contacts that need verification
-        # Skip already-verified (APIFY_VERIFIED, SMTP_VERIFIED, WEB_SCRAPED, VALID, INVALID)
+        # Skip contacts already verified by a high-confidence source
         contacts = session.query(Contact).filter(
-            Contact.verified.in_([None, "GUESSED", "APIFY_UNVERIFIED", "CATCH_ALL_PATTERN", "PATTERN_UNVERIFIED"])
+            Contact.verified.notin_(list(_ALREADY_VERIFIED)),
+        ).filter(
+            Contact.email.isnot(None),
         ).all()
 
-        # Count already-verified contacts (from Apify or custom email finder)
         pre_verified = session.query(Contact).filter(
-            Contact.verified.in_(["APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED"])
-        ).all()
-        log.info(f"Found {len(contacts)} contacts to verify, {len(pre_verified)} already pre-verified")
+            Contact.verified.in_(list(_ALREADY_VERIFIED))
+        ).count()
 
-        valid_count = 0
+        log.info(
+            f"Found {len(contacts)} contacts to verify, "
+            f"{pre_verified} already pre-verified (skipped)"
+        )
+
+        pattern_accepted = 0
         invalid_count = 0
-        skipped_count = 0
 
         for contact in contacts:
             if not contact.email:
@@ -123,52 +136,57 @@ def run(dry_run: bool = False):
                 log.info(f"    [DRY RUN] Would verify {contact.email}")
                 continue
 
-            try:
-                # Try SMTP verification first, fall back to basic
-                is_valid = verify_email_smtp(contact.email)
-                if not is_valid:
-                    is_valid = verify_email_basic(contact.email)
-
-                if is_valid:
-                    contact.verified = "VALID"
-                    valid_count += 1
-                    log.info(f"    [OK] VALID")
-                else:
-                    # For guessed emails, mark as INVALID
-                    # For Apify-unverified, mark as INVALID too
-                    contact.verified = "INVALID"
-                    invalid_count += 1
-                    log.info(f"    [FAIL] INVALID")
-
-            except Exception as e:
-                log.error(f"    [FAIL] Verification error for {contact.email}: {e}")
+            # Contacts marked NOT_FOUND have no email to verify
+            if contact.email_source == "NOT_FOUND" or contact.verified == "NOT_FOUND":
                 contact.verified = "INVALID"
                 invalid_count += 1
+                log.info(f"    ✗ INVALID (no verified email found)")
+                continue
 
-        # Update company statuses
-        # Companies with APIFY_VERIFIED or VALID contacts should advance
+            result = verify_contact(contact.email)
+            contact.verified = result
+
+            if result == "PATTERN_ACCEPTED":
+                pattern_accepted += 1
+                log.info(f"    ~ PATTERN_ACCEPTED (MX exists, will proceed)")
+            else:
+                invalid_count += 1
+                log.info(f"    ✗ INVALID (bad format or dead domain)")
+
+        # Advance companies: any company with a usable contact → EMAIL_VERIFIED
         if not dry_run:
-            companies_with_contacts = (
+            companies = (
                 session.query(Company)
                 .filter_by(status="CONTACT_FOUND")
                 .all()
             )
-            for company in companies_with_contacts:
-                # Count all usable contacts (verified by any method)
-                usable_contacts = (
+            advanced = 0
+            for company in companies:
+                usable = (
                     session.query(Contact)
                     .filter(
                         Contact.company_id == company.id,
-                        Contact.verified.in_(["VALID", "APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED"])
+                        Contact.verified.in_(list(_USABLE)),
                     )
                     .count()
                 )
-                if usable_contacts > 0:
+                if usable > 0:
                     company.status = "EMAIL_VERIFIED"
                     company.updated_at = utcnow()
-                    log.info(f"  Company '{company.name}' → EMAIL_VERIFIED ({usable_contacts} valid contacts)")
+                    advanced += 1
+                    log.info(
+                        f"  '{company.name}' → EMAIL_VERIFIED "
+                        f"({usable} usable contact(s))"
+                    )
 
-        log.info(f"Verification complete: {valid_count} valid, {invalid_count} invalid, {len(pre_verified)} pre-verified (skipped)")
+            log.info(f"  Advanced {advanced} companies to EMAIL_VERIFIED")
+
+        log.info(
+            f"Verification complete: "
+            f"{pattern_accepted} PATTERN_ACCEPTED, "
+            f"{invalid_count} INVALID, "
+            f"{pre_verified} pre-verified (skipped)"
+        )
 
 
 if __name__ == "__main__":

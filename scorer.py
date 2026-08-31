@@ -29,7 +29,50 @@ def calculate_score(company: Company, signals: list[Signal]) -> tuple[int, list[
     score = 0
     reasons = []
 
-    # ── Signal-based scoring ───────────────────────────────
+    # ── Hard disqualifications ─────────────────────────────
+    # These org types will never buy B2B software QA services
+    name_lower = (company.name or "").lower()
+    industry_lower = (company.industry or "").lower()
+
+    _DISQUALIFY_NAME_PATTERNS = (
+        # Education
+        "university", "college", "school", "institute", "academy",
+        # Healthcare / Gov / Non-profit
+        "hospital", "clinic", "health system", "medical center",
+        "government", "department of ", "ministry of ",
+        "church", "nonprofit", "foundation", "charity",
+        # Staffing & recruiting — they post jobs but never buy QA tools
+        "staffing", "recruiting", "recruiter", "talent solutions",
+        "talent acquisition", "workforce solutions", "manpower",
+        "temp agency", "placement agency", " hcm",  # e.g. "Cypress HCM"
+        "human capital",
+    )
+    _DISQUALIFY_INDUSTRY_PATTERNS = (
+        # Education / Gov / Non-profit
+        "education", "higher education", "primary/secondary education",
+        "hospital", "health care", "government administration",
+        "non-profit", "nonprofit", "religious institutions",
+        "military", "judiciary",
+        # Staffing / HR — post tons of jobs, never QA buyers
+        "staffing and recruiting", "staffing & recruiting",
+        "human resources", "outsourcing/offshoring",
+        "executive search",
+    )
+
+    for pattern in _DISQUALIFY_NAME_PATTERNS:
+        if pattern in name_lower:
+            score -= 200
+            reasons.append(f"DISQUALIFIED (name contains '{pattern}'): -200")
+            return score, reasons  # Early exit — no point scoring further
+
+    for pattern in _DISQUALIFY_INDUSTRY_PATTERNS:
+        if pattern in industry_lower:
+            score -= 200
+            reasons.append(f"DISQUALIFIED (industry='{company.industry}'): -200")
+            return score, reasons
+
+
+
     signal_types = {s.signal_type for s in signals}
 
     if "JOB_POSTING" in signal_types:
@@ -103,48 +146,86 @@ def calculate_score(company: Company, signals: list[Signal]) -> tuple[int, list[
     return score, reasons
 
 
-def run(dry_run: bool = False):
-    """Score all companies with status ENRICHED."""
+def run(dry_run: bool = False, rescore: bool = False):
+    """
+    Score companies.
+
+    Args:
+        dry_run:  Print what would happen without writing to DB.
+        rescore:  If True, re-evaluate ALL companies (any status),
+                  not just ENRICHED ones. Useful after adding new
+                  disqualification rules.
+    """
     init_db()
-    log.info("Starting ICP scoring...")
+    mode = "RESCORE ALL" if rescore else "new ENRICHED companies"
+    log.info(f"Starting ICP scoring ({mode})...")
+
+    # Statuses that indicate the company is already downstream in the pipeline
+    _DOWNSTREAM_STATUSES = {
+        "QUALIFIED", "CONTACT_FOUND", "EMAIL_VERIFIED",
+        "RESEARCH_DONE", "EMAIL_READY", "EMAIL_SENT", "REPLIED",
+    }
 
     with get_session() as session:
-        companies = session.query(Company).filter_by(status="ENRICHED").all()
+        if rescore:
+            # Re-score everything except NEW_SIGNAL (no data yet) and REJECTED
+            companies = session.query(Company).filter(
+                Company.status.notin_(["NEW_SIGNAL", "REJECTED"])
+            ).all()
+        else:
+            companies = session.query(Company).filter_by(status="ENRICHED").all()
+
         log.info(f"Found {len(companies)} companies to score")
 
         qualified = 0
         rejected = 0
+        reverted = 0
 
         for company in companies:
             signals = session.query(Signal).filter_by(company_id=company.id).all()
             score, reasons = calculate_score(company, signals)
 
-            log.info(f"  {company.name}: score={score} (threshold={ICP_SCORE_THRESHOLD})")
+            log.info(f"  {company.name}: score={score} (threshold={ICP_SCORE_THRESHOLD}, current={company.status})")
             for r in reasons:
                 log.info(f"    {r}")
 
             if dry_run:
-                status = "QUALIFIED" if score >= ICP_SCORE_THRESHOLD else "REJECTED"
-                log.info(f"    [DRY RUN] → {status}")
+                new_status = "QUALIFIED" if score >= ICP_SCORE_THRESHOLD else "REJECTED"
+                log.info(f"    [DRY RUN] -> {new_status}")
                 continue
 
             company.icp_score = score
             company.updated_at = utcnow()
 
             if score >= ICP_SCORE_THRESHOLD:
-                company.status = "QUALIFIED"
-                qualified += 1
+                # Only update status if currently ENRICHED (don't demote downstream)
+                if company.status == "ENRICHED":
+                    company.status = "QUALIFIED"
+                    qualified += 1
+                else:
+                    qualified += 1  # Already qualified or further — leave it
             else:
+                was_downstream = company.status in _DOWNSTREAM_STATUSES
                 company.status = "REJECTED"
                 rejected += 1
+                if was_downstream:
+                    reverted += 1
+                    log.warning(
+                        f"  !! Reverted '{company.name}' from downstream pipeline "
+                        f"(was {company.status!r}) — now REJECTED"
+                    )
 
-        log.info(f"Scoring complete: {qualified} qualified, {rejected} rejected")
+        summary = f"Scoring complete: {qualified} qualified, {rejected} rejected"
+        if rescore:
+            summary += f" ({reverted} reverted from downstream pipeline)"
+        log.info(summary)
 
 
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
+    rescore = "--rescore" in sys.argv
     try:
-        run(dry_run=dry_run)
+        run(dry_run=dry_run, rescore=rescore)
     except Exception as e:
         log.error(f"Scorer failed: {e}", exc_info=True)
         sys.exit(1)

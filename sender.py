@@ -165,6 +165,26 @@ def run(dry_run: bool = False):
                 if EMAIL_SEND_DELAY_SECONDS > 0:
                     time.sleep(EMAIL_SEND_DELAY_SECONDS)
 
+            except smtplib.SMTPRecipientsRefused as e:
+                # Hard bounce — address does not exist on the server
+                email.status = "FAILED"
+                failed_count += 1
+                log.error(f"    [BOUNCE] Hard bounce for {contact.email}: {e}")
+                # Invalidate the contact so future follow-ups are skipped
+                contact.verified = "INVALID"
+                contact.email = None  # Clear the bad address
+                log.info(f"    Marked contact #{contact.id} email as INVALID (hard bounce)")
+
+            except smtplib.SMTPDataError as e:
+                code = e.smtp_code or 0
+                email.status = "FAILED"
+                failed_count += 1
+                log.error(f"    [FAIL] SMTP data error {code}: {e}")
+                if code >= 500:
+                    # Permanent error — treat as hard bounce
+                    contact.verified = "INVALID"
+                    log.info(f"    Marked contact #{contact.id} as INVALID (5xx error)")
+
             except smtplib.SMTPException as e:
                 email.status = "FAILED"
                 failed_count += 1
