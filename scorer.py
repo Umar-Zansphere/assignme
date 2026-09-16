@@ -1,174 +1,241 @@
 """
-scorer.py — Stage 3: ICP Scorer
+scorer.py — Stage 2: Campaign-Driven ICP Scorer
 
-Applies rule-based scoring to enriched companies.
-Qualifies or rejects based on score threshold.
+Loads scoring rules from the campaign config. Applies dynamic rules based on
+what the LLM generated and the user reviewed. Falls back to legacy hardcoded
+rules if no campaign config exists.
 
 Usage:
     python scorer.py
     python scorer.py --dry-run
+    python scorer.py --rescore
 """
 
 import sys
 
 from database import get_session, init_db
-from models import Company, Signal
+from models import Company, Signal, Campaign
 from config import ICP_SCORE_THRESHOLD, ICP_SCORING_RULES
-from utils import get_logger, utcnow
+from utils import get_logger, utcnow, safe_json_loads
 
 log = get_logger("scorer")
 
 
-def calculate_score(company: Company, signals: list[Signal]) -> tuple[int, list[str]]:
+def _load_campaign_rules(session, company: Company) -> tuple[list[dict], int, list[str], list[str]]:
     """
-    Calculate ICP score for a company based on rules.
+    Load scoring rules from the company's campaign.
 
     Returns:
-        (total_score, list of matched rules with points)
+        (scoring_rules, threshold, exclusion_list, target_geography)
+    """
+    if company.campaign_id:
+        campaign = session.query(Campaign).filter_by(id=company.campaign_id).first()
+        if campaign:
+            rules = safe_json_loads(campaign.scoring_rules) or []
+            threshold = campaign.scoring_threshold or ICP_SCORE_THRESHOLD
+            exclusions = safe_json_loads(campaign.exclusion_list) or []
+            geography = safe_json_loads(campaign.target_geography) or []
+            return rules, threshold, exclusions, geography
+
+    return [], ICP_SCORE_THRESHOLD, [], []
+
+
+def calculate_score_dynamic(
+    company: Company,
+    signals: list[Signal],
+    rules: list[dict],
+    exclusions: list[str],
+    target_geography: list[str] | None = None,
+) -> tuple[int, list[str]]:
+    """
+    Calculate ICP score using campaign-defined dynamic rules.
+
+    Rule types:
+        - "keyword": matches keywords against company name/industry/description
+        - "size": checks employee count range
+        - "geography": checks company country
+        - "signal": checks what signal source found the company
     """
     score = 0
     reasons = []
 
-    # ── Hard disqualifications ─────────────────────────────
-    # These org types will never buy B2B software QA services
+    name_lower = (company.name or "").lower()
+    industry_lower = (company.industry or "").lower()
+    country_lower = (company.country or "").lower()
+    description_lower = (company.description_ai or "").lower()
+    category_lower = (company.category or "").lower()
+
+    # ── Hard disqualification by exclusion list ──
+    all_text = f"{name_lower} {industry_lower} {category_lower}"
+    for exclusion in exclusions:
+        if exclusion.lower() in all_text:
+            score -= 200
+            reasons.append(f"DISQUALIFIED (matches exclusion '{exclusion}'): -200")
+            return score, reasons
+
+    # ── Automatic geography enforcement ──
+    # If campaign has target_geography and the company has a known country,
+    # penalize companies outside the target region heavily.
+    if target_geography and country_lower:
+        geo_lower = {g.lower().strip() for g in target_geography}
+        address_lower = (company.address or "").lower()
+        all_location = f"{country_lower} {address_lower}"
+        if not any(g in all_location for g in geo_lower):
+            score -= 100
+            reasons.append(f"Outside target geography {target_geography} (country={company.country}): -100")
+
+    # ── Apply dynamic rules ──
+    for rule in rules:
+        rule_type = rule.get("type", "keyword")
+        weight = rule.get("weight", 0)
+        rule_desc = rule.get("rule", "Unknown rule")
+
+        if rule_type == "keyword":
+            keywords = rule.get("keywords", [])
+            if not keywords:
+                continue
+
+            # For NEGATIVE rules, only match against company name — NOT industry/category
+            # because Google Maps assigns generic categories like "Motor vehicle dealer"
+            # to actual manufacturers, which causes mass false disqualifications.
+            if weight < 0:
+                searchable = f"{name_lower}"
+            else:
+                # For positive rules, match broadly against all fields
+                searchable = f"{name_lower} {industry_lower} {description_lower} {category_lower}"
+
+            matched = False
+            matched_kw = None
+            for kw in keywords:
+                kw_lower = kw.lower().strip()
+                # First try exact phrase match
+                if kw_lower in searchable:
+                    matched = True
+                    matched_kw = kw
+                    break
+                # Then try: if ALL individual words in the keyword appear in the text
+                words = kw_lower.split()
+                if len(words) > 1 and all(w in searchable for w in words):
+                    matched = True
+                    matched_kw = kw
+                    break
+
+            if matched:
+                score += weight
+                reasons.append(f"{rule_desc} (matched '{matched_kw}'): {'+' if weight > 0 else ''}{weight}")
+
+        elif rule_type == "size":
+            emp = company.employee_count or 0
+            min_size = rule.get("min", 0)
+            max_size = rule.get("max", 999999)
+            if min_size <= emp <= max_size:
+                score += weight
+                reasons.append(f"{rule_desc} (employees={emp}): {'+' if weight > 0 else ''}{weight}")
+
+        elif rule_type == "geography":
+            target_countries = [c.lower() for c in rule.get("countries", [])]
+            if country_lower in target_countries:
+                score += weight
+                reasons.append(f"{rule_desc} (country={company.country}): {'+' if weight > 0 else ''}{weight}")
+
+        elif rule_type == "signal":
+            signal_sources = {s.source for s in signals}
+            target_sources = rule.get("sources", [])
+            if any(src in signal_sources for src in target_sources):
+                score += weight
+                reasons.append(f"{rule_desc}: {'+' if weight > 0 else ''}{weight}")
+
+    # ── Automatic geography bonus ──
+    # Companies in the target geography get a baseline boost
+    if target_geography and country_lower:
+        geo_lower = {g.lower().strip() for g in target_geography}
+        address_lower = (company.address or "").lower()
+        all_location = f"{country_lower} {address_lower}"
+        if any(g in all_location for g in geo_lower):
+            score += 20
+            reasons.append(f"In target geography {target_geography}: +20")
+
+    # ── Multi-source bonus ──
+    sources = safe_json_loads(company.signal_sources_json) or []
+    if len(sources) >= 3:
+        score += 40
+        reasons.append(f"Multi-source bonus (found in {len(sources)} sources): +40")
+    elif len(sources) >= 2:
+        score += 20
+        reasons.append(f"Multi-source bonus (found in {len(sources)} sources): +20")
+
+    return score, reasons
+
+
+def calculate_score_legacy(company: Company, signals: list[Signal]) -> tuple[int, list[str]]:
+    """
+    Legacy hardcoded scoring — used when no campaign rules exist.
+    Preserves backward compatibility with the original QA-focused pipeline.
+    """
+    score = 0
+    reasons = []
+
     name_lower = (company.name or "").lower()
     industry_lower = (company.industry or "").lower()
 
-    _DISQUALIFY_NAME_PATTERNS = (
-        # Education
-        "university", "college", "school", "institute", "academy",
-        # Healthcare / Gov / Non-profit
-        "hospital", "clinic", "health system", "medical center",
-        "government", "department of ", "ministry of ",
-        "church", "nonprofit", "foundation", "charity",
-        # Staffing & recruiting — they post jobs but never buy QA tools
+    # Hard disqualifications
+    _DISQUALIFY_PATTERNS = (
+        "university", "college", "school", "hospital", "clinic",
+        "government", "church", "nonprofit", "foundation",
         "staffing", "recruiting", "recruiter", "talent solutions",
-        "talent acquisition", "workforce solutions", "manpower",
-        "temp agency", "placement agency", " hcm",  # e.g. "Cypress HCM"
-        "human capital",
+        "human capital", "manpower", "temp agency",
     )
-    _DISQUALIFY_INDUSTRY_PATTERNS = (
-        # Education / Gov / Non-profit
-        "education", "higher education", "primary/secondary education",
-        "hospital", "health care", "government administration",
-        "non-profit", "nonprofit", "religious institutions",
-        "military", "judiciary",
-        # Staffing / HR — post tons of jobs, never QA buyers
-        "staffing and recruiting", "staffing & recruiting",
-        "human resources", "outsourcing/offshoring",
-        "executive search",
-    )
+    for pattern in _DISQUALIFY_PATTERNS:
+        if pattern in name_lower or pattern in industry_lower:
+            return -200, [f"DISQUALIFIED (contains '{pattern}'): -200"]
 
-    for pattern in _DISQUALIFY_NAME_PATTERNS:
-        if pattern in name_lower:
-            score -= 200
-            reasons.append(f"DISQUALIFIED (name contains '{pattern}'): -200")
-            return score, reasons  # Early exit — no point scoring further
-
-    for pattern in _DISQUALIFY_INDUSTRY_PATTERNS:
-        if pattern in industry_lower:
-            score -= 200
-            reasons.append(f"DISQUALIFIED (industry='{company.industry}'): -200")
-            return score, reasons
-
-
-
+    # Signal-based scoring
     signal_types = {s.signal_type for s in signals}
-
     if "JOB_POSTING" in signal_types:
-        # Check if hiring engineers specifically
-        engineering_keywords = {"engineer", "developer", "software", "backend", "frontend", "devops", "sre", "qa"}
-        for s in signals:
-            if s.signal_type == "JOB_POSTING" and s.title:
-                title_lower = s.title.lower()
-                if any(kw in title_lower for kw in engineering_keywords):
-                    pts = ICP_SCORING_RULES.get("hiring_engineers", 30)
-                    score += pts
-                    reasons.append(f"Hiring engineers: +{pts}")
-                    break  # Count once
-
-    if "PRODUCT_LAUNCH" in signal_types:
-        pts = ICP_SCORING_RULES.get("product_launch", 15)
+        pts = ICP_SCORING_RULES.get("hiring_engineers", 30)
         score += pts
-        reasons.append(f"Product launch: +{pts}")
+        reasons.append(f"Hiring (job posting signal): +{pts}")
 
     if "FUNDING" in signal_types:
         pts = ICP_SCORING_RULES.get("recent_funding", 25)
         score += pts
         reasons.append(f"Recent funding: +{pts}")
 
-    if "NEWS" in signal_types:
-        pts = ICP_SCORING_RULES.get("company_news", 15)
-        score += pts
-        reasons.append(f"Company news signal: +{pts}")
-
-    # ── Industry scoring ───────────────────────────────────
-    industry = (company.industry or "").lower()
-    if "health" in industry:
-        pts = ICP_SCORING_RULES.get("healthtech", 20)
-        score += pts
-        reasons.append(f"HealthTech: +{pts}")
-    elif "fin" in industry:
-        pts = ICP_SCORING_RULES.get("fintech", 15)
-        score += pts
-        reasons.append(f"FinTech: +{pts}")
-    elif any(kw in industry for kw in ("ai", "artificial intelligence", "tech", "software", "internet", "social media", "dating", "automotive")):
+    # Industry scoring
+    industry = industry_lower
+    if any(kw in industry for kw in ("tech", "software", "ai", "internet")):
         pts = ICP_SCORING_RULES.get("tech_ai", 20)
         score += pts
-        reasons.append(f"Tech/AI/Software industry: +{pts}")
+        reasons.append(f"Tech/AI industry: +{pts}")
 
-    # ── Geography scoring ──────────────────────────────────
+    # Geography
     country = (company.country or "").upper()
-    if country in ("USA", "US", "UNITED STATES"):
-        pts = ICP_SCORING_RULES.get("usa", 10)
-        score += pts
-        reasons.append(f"USA: +{pts}")
-    elif country in ("UK", "GERMANY", "FRANCE", "NETHERLANDS", "SWEDEN"):
-        pts = ICP_SCORING_RULES.get("europe", 5)
-        score += pts
-        reasons.append(f"Europe: +{pts}")
+    if country in ("USA", "US"):
+        score += ICP_SCORING_RULES.get("usa", 10)
+        reasons.append(f"USA: +{ICP_SCORING_RULES.get('usa', 10)}")
 
-    # ── Employee count scoring ─────────────────────────────
+    # Employee count
     emp = company.employee_count or 0
     if 20 <= emp <= 200:
         pts = ICP_SCORING_RULES.get("employee_20_200", 20)
         score += pts
         reasons.append(f"20-200 employees: +{pts}")
-    elif 200 < emp <= 1000:
-        pts = ICP_SCORING_RULES.get("employee_200_1000", 10)
-        score += pts
-        reasons.append(f"200-1000 employees: +{pts}")
     elif emp > 10000:
         pts = ICP_SCORING_RULES.get("employee_10000_plus", -50)
         score += pts
-        reasons.append(f">10000 employees: {pts} (Enterprise Penalty)")
+        reasons.append(f">10000 employees: {pts}")
 
     return score, reasons
 
 
 def run(dry_run: bool = False, rescore: bool = False):
-    """
-    Score companies.
-
-    Args:
-        dry_run:  Print what would happen without writing to DB.
-        rescore:  If True, re-evaluate ALL companies (any status),
-                  not just ENRICHED ones. Useful after adding new
-                  disqualification rules.
-    """
+    """Score companies using campaign rules or legacy fallback."""
     init_db()
     mode = "RESCORE ALL" if rescore else "new ENRICHED companies"
     log.info(f"Starting ICP scoring ({mode})...")
 
-    # Statuses that indicate the company is already downstream in the pipeline
-    _DOWNSTREAM_STATUSES = {
-        "QUALIFIED", "CONTACT_FOUND", "EMAIL_VERIFIED",
-        "RESEARCH_DONE", "EMAIL_READY", "EMAIL_SENT", "REPLIED",
-    }
-
     with get_session() as session:
         if rescore:
-            # Re-score everything except NEW_SIGNAL (no data yet) and REJECTED
             companies = session.query(Company).filter(
                 Company.status.notin_(["NEW_SIGNAL", "REJECTED"])
             ).all()
@@ -179,46 +246,43 @@ def run(dry_run: bool = False, rescore: bool = False):
 
         qualified = 0
         rejected = 0
-        reverted = 0
 
         for company in companies:
             signals = session.query(Signal).filter_by(company_id=company.id).all()
-            score, reasons = calculate_score(company, signals)
 
-            log.info(f"  {company.name}: score={score} (threshold={ICP_SCORE_THRESHOLD}, current={company.status})")
+            # Load campaign-specific rules
+            rules, threshold, exclusions, geography = _load_campaign_rules(session, company)
+
+            if rules:
+                # Dynamic campaign-driven scoring
+                score, reasons = calculate_score_dynamic(company, signals, rules, exclusions, geography)
+                log.info(f"  {company.name}: score={score} (campaign threshold={threshold})")
+            else:
+                # Legacy fallback
+                score, reasons = calculate_score_legacy(company, signals)
+                threshold = ICP_SCORE_THRESHOLD
+                log.info(f"  {company.name}: score={score} (legacy threshold={threshold})")
+
             for r in reasons:
                 log.info(f"    {r}")
 
             if dry_run:
-                new_status = "QUALIFIED" if score >= ICP_SCORE_THRESHOLD else "REJECTED"
+                new_status = "QUALIFIED" if score >= threshold else "REJECTED"
                 log.info(f"    [DRY RUN] -> {new_status}")
                 continue
 
             company.icp_score = score
             company.updated_at = utcnow()
 
-            if score >= ICP_SCORE_THRESHOLD:
-                # Only update status if currently ENRICHED (don't demote downstream)
+            if score >= threshold:
                 if company.status == "ENRICHED":
                     company.status = "QUALIFIED"
-                    qualified += 1
-                else:
-                    qualified += 1  # Already qualified or further — leave it
+                qualified += 1
             else:
-                was_downstream = company.status in _DOWNSTREAM_STATUSES
                 company.status = "REJECTED"
                 rejected += 1
-                if was_downstream:
-                    reverted += 1
-                    log.warning(
-                        f"  !! Reverted '{company.name}' from downstream pipeline "
-                        f"(was {company.status!r}) — now REJECTED"
-                    )
 
-        summary = f"Scoring complete: {qualified} qualified, {rejected} rejected"
-        if rescore:
-            summary += f" ({reverted} reverted from downstream pipeline)"
-        log.info(summary)
+        log.info(f"Scoring complete: {qualified} qualified, {rejected} rejected")
 
 
 if __name__ == "__main__":
@@ -229,3 +293,4 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"Scorer failed: {e}", exc_info=True)
         sys.exit(1)
+

@@ -1,15 +1,16 @@
 """
-email_finder.py — Email Finder with Prospeo API + Domain Pattern Learning.
+email_finder.py — Email Finder with FullEnrich (Primary) + Prospeo (Fallback) + Domain Pattern Learning.
 
-Replaces the old DIY pattern-guessing + SMTP probing approach with:
+Multi-provider email discovery pipeline:
   1. Cached domain pattern lookup (free — no API call)
-  2. Prospeo API for verified email discovery
-  3. Pattern learning — extracts and caches the naming convention
+  2. FullEnrich API — primary finder (20+ provider waterfall, highest hit rate)
+  3. Prospeo API — fallback finder (also provides company enrichment data)
+  4. Pattern learning — extracts and caches the naming convention
      from each verified email so future lookups at the same domain
      are faster and cheaper
 
 Key principle: NEVER return unverified / guessed emails.
-If Prospeo can't find it, we return NOT_FOUND instead of guessing.
+If neither provider can find it, we return NOT_FOUND instead of guessing.
 
 Usage:
     from email_finder import find_email
@@ -20,6 +21,7 @@ Usage:
 
 import re
 
+from config import FULLENRICH_API_KEY
 from utils import get_logger
 from prospeo_client import find_email as prospeo_find_email
 
@@ -192,36 +194,69 @@ def _save_pattern(
         log.warning(f"Failed to save pattern cache for {domain}: {e}")
 
 
+# ── FullEnrich Finder ─────────────────────────────────────
+
+def _try_fullenrich(first_name: str, last_name: str, domain: str, linkedin_url: str = "") -> dict | None:
+    """
+    Try to find email via FullEnrich (primary provider).
+
+    Returns the FullEnrich result dict if email found, or None.
+    Only called if FULLENRICH_API_KEY is configured.
+    """
+    if not FULLENRICH_API_KEY:
+        log.debug("  FullEnrich API key not configured, skipping")
+        return None
+
+    try:
+        from fullenrich_client import find_email as fullenrich_find_email
+        result = fullenrich_find_email(first_name, last_name, domain, linkedin_url=linkedin_url)
+
+        if result.get("email"):
+            return result
+        else:
+            log.info(f"  FullEnrich found no email for {first_name} {last_name} @ {domain}")
+            return None
+
+    except Exception as e:
+        log.warning(f"  FullEnrich lookup failed: {e}")
+        return None
+
+
 # ── Main Entry Point ──────────────────────────────────────
 
-def find_email(first_name: str, last_name: str, domain: str) -> dict:
+def find_email(first_name: str, last_name: str, domain: str, linkedin_url: str = "") -> dict:
     """
-    Find a verified email address using Prospeo + domain pattern cache.
+    Find a verified email address using FullEnrich (primary) + Prospeo (fallback)
+    + domain pattern cache.
 
     Flow:
       1. Check cached pattern for this domain
-         → If found: generate candidate, verify via Prospeo
-         → If verified: return (cheap cache hit)
+         → If found: generate candidate (informational — still need API verification)
 
-      2. No cache or cache miss:
-         → Call Prospeo email-finder API
+      2. Try FullEnrich (primary — 20+ provider waterfall, highest hit rate)
          → If found: return + learn pattern + cache it
 
-      3. If nothing works: return NOT_FOUND (NEVER guess)
+      3. Try Prospeo (fallback — also provides rich company enrichment data)
+         → If found: return + learn pattern + cache it
+
+      4. If nothing works: return NOT_FOUND (NEVER guess)
 
     Args:
         first_name: Person's first name.
         last_name: Person's last name (surname).
         domain: Company domain (e.g., 'company.com').
+        linkedin_url: Optional LinkedIn profile URL (improves FullEnrich hit rate).
 
     Returns:
         dict with keys:
             - "email": str (found email or "")
             - "verified": bool
-            - "source": str ("PROSPEO_VERIFIED", "PROSPEO_CATCH_ALL",
-                             "PATTERN_CACHE_HIT", "NOT_FOUND")
+            - "source": str ("FULLENRICH_VERIFIED", "FULLENRICH_CATCH_ALL",
+                             "PROSPEO_VERIFIED", "PROSPEO_CATCH_ALL",
+                             "NOT_FOUND")
             - "catch_all": bool
             - "raw": dict (details about the discovery method)
+            - "enrichment": dict (contact + company data from whichever provider found it)
     """
     if not first_name or not last_name or not domain:
         log.warning(
@@ -243,56 +278,55 @@ def find_email(first_name: str, last_name: str, domain: str) -> dict:
             f"  Cache hit: domain '{domain}' uses pattern "
             f"'{cached['pattern']}' (confidence={cached['confidence']})"
         )
-
-        # Generate candidate from cached pattern
+        # Generate candidate for logging/debugging — we still verify via API
         candidate = generate_from_pattern(
             cached["pattern"], first_name, last_name, domain
         )
-
         if candidate:
-            log.info(f"  Verifying cached pattern candidate: {candidate}")
+            log.info(f"  Pattern candidate: {candidate}")
 
-            # Verify the candidate through Prospeo
-            result = prospeo_find_email(first_name, last_name, domain)
+    # ── Step 2: Try FullEnrich (primary) ──────────────────
+    log.info(f"  Trying FullEnrich (primary) for {first_name} {last_name} @ {domain}")
+    fe_result = _try_fullenrich(first_name, last_name, domain, linkedin_url=linkedin_url)
 
-            if result["email"]:
-                email = result["email"]
-                is_catch_all = result.get("catch_all", False)
+    if fe_result and fe_result.get("email"):
+        email = fe_result["email"]
+        is_catch_all = fe_result.get("catch_all", False)
+        source = fe_result.get("source", "FULLENRICH_VERIFIED")
 
-                # Learn from this result too (reinforces or corrects pattern)
-                detected = detect_pattern(email, first_name, last_name)
-                if detected:
-                    catch_all_str = "YES" if is_catch_all else "NO"
-                    _save_pattern(domain, detected, catch_all_str, email)
+        # Learn pattern
+        detected = detect_pattern(email, first_name, last_name)
+        if detected:
+            catch_all_str = "YES" if is_catch_all else "NO"
+            _save_pattern(domain, detected, catch_all_str, email)
+            log.info(f"  Learned pattern for {domain}: {detected}")
 
-                source = "PROSPEO_CATCH_ALL" if is_catch_all else "PROSPEO_VERIFIED"
-                log.info(f"  [OK] Verified via Prospeo: {email} ({source})")
+        log.info(f"  [OK] FullEnrich found: {email} ({source})")
 
-                return {
-                    "email": email,
-                    "verified": not is_catch_all,
-                    "source": source,
-                    "catch_all": is_catch_all,
-                    "raw": {
-                        "method": "pattern_cache_then_prospeo",
-                        "cached_pattern": cached["pattern"],
-                        "candidate": candidate,
-                        "prospeo_result": result.get("raw", {}),
-                    },
-                }
-            else:
-                log.info(f"  Cache candidate not verified by Prospeo, trying full lookup...")
+        return {
+            "email": email,
+            "verified": not is_catch_all,
+            "source": source,
+            "catch_all": is_catch_all,
+            "raw": {
+                "method": "fullenrich",
+                "detected_pattern": detected,
+                "fullenrich_result": fe_result.get("raw", {}),
+            },
+            "enrichment": fe_result.get("enrichment"),
+        }
 
-    # ── Step 2: Full Prospeo lookup (no cache) ────────────
-    log.info(f"  Full Prospeo lookup for {first_name} {last_name} @ {domain}")
+    # ── Step 3: Try Prospeo (fallback) ────────────────────
+    log.info(f"  Trying Prospeo (fallback) for {first_name} {last_name} @ {domain}")
 
-    result = prospeo_find_email(first_name, last_name, domain)
+    prospeo_result = prospeo_find_email(first_name, last_name, domain)
 
-    if result["email"]:
-        email = result["email"]
-        is_catch_all = result.get("catch_all", False)
+    if prospeo_result["email"]:
+        email = prospeo_result["email"]
+        is_catch_all = prospeo_result.get("catch_all", False)
+        source = prospeo_result.get("source", "PROSPEO_VERIFIED")
 
-        # Learn the pattern from this result
+        # Learn pattern
         detected = detect_pattern(email, first_name, last_name)
         if detected:
             catch_all_str = "YES" if is_catch_all else "NO"
@@ -304,8 +338,7 @@ def find_email(first_name: str, last_name: str, domain: str) -> dict:
                 f"for {first_name} {last_name}"
             )
 
-        source = "PROSPEO_CATCH_ALL" if is_catch_all else "PROSPEO_VERIFIED"
-        log.info(f"  [OK] Found: {email} ({source})")
+        log.info(f"  [OK] Prospeo (fallback) found: {email} ({source})")
 
         return {
             "email": email,
@@ -313,13 +346,14 @@ def find_email(first_name: str, last_name: str, domain: str) -> dict:
             "source": source,
             "catch_all": is_catch_all,
             "raw": {
-                "method": "prospeo_direct",
+                "method": "prospeo_fallback",
                 "detected_pattern": detected,
-                "prospeo_result": result.get("raw", {}),
+                "prospeo_result": prospeo_result.get("raw", {}),
             },
+            "enrichment": prospeo_result.get("enrichment"),
         }
 
-    # ── Step 3: Not found — NO guessing ───────────────────
+    # ── Step 4: Not found — NO guessing ───────────────────
     log.info(f"  [NOT FOUND] No verified email for {first_name} {last_name} @ {domain}")
     return _not_found()
 
@@ -340,9 +374,11 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 4:
         first, last, dom = sys.argv[1], sys.argv[2], sys.argv[3]
+        linkedin = sys.argv[4] if len(sys.argv) > 4 else ""
     else:
         first, last, dom = "test", "user", "example.com"
+        linkedin = ""
 
     print(f"Finding email for: {first} {last} @ {dom}")
-    result = find_email(first, last, dom)
+    result = find_email(first, last, dom, linkedin_url=linkedin)
     print(f"Result: {result}")

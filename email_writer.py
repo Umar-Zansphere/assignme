@@ -1,8 +1,12 @@
 """
-email_writer.py — Stage 7: Email Writer
+email_writer.py — Stage 6: Campaign-Aware Email Writer
 
-Uses OpenRouter LLM to generate personalized outreach emails.
-Creates initial email + 2 follow-ups per company/contact pair.
+Generates personalized email sequences using campaign framing:
+  - our_offering, value_proposition, pitch_angle from campaign config
+  - References the actual signal that triggered outreach
+  - Uses campaign target_roles for tone adaptation
+
+Falls back to generic cold email prompt when no campaign exists.
 
 Usage:
     python email_writer.py
@@ -18,10 +22,13 @@ from models import Company, Contact, Research, Email, Campaign
 from openrouter_client import call_llm_with_schema
 from config import FOLLOWUP_1_DELAY_DAYS, FOLLOWUP_2_DELAY_DAYS
 from utils import get_logger, safe_json_loads, utcnow
+from compliance import generate_unsubscribe_token
+from debug_contact import ensure_debug_contact, inject_debug_contact_for_all_campaigns
 
 log = get_logger("email_writer")
 
-EMAIL_PROMPT = """You are an elite B2B cold email copywriter.
+# Default prompt (no campaign)
+EMAIL_PROMPT_DEFAULT = """You are an elite B2B cold email copywriter.
 
 Write a personalized cold email sequence for outbound sales outreach.
 
@@ -45,6 +52,43 @@ Respond with ONLY a JSON object containing:
 """
 
 
+def _build_campaign_email_prompt(campaign: Campaign) -> str:
+    """Build campaign-specific email writing prompt."""
+    our_offering = campaign.our_offering or "our solution"
+    value_prop = campaign.value_proposition or ""
+    pitch_angle = campaign.pitch_angle or ""
+
+    return f"""You are an elite B2B cold email copywriter working on a targeted campaign.
+
+Our company provides: {our_offering}
+Value proposition: {value_prop}
+Outreach angle: {pitch_angle}
+
+Write a personalized cold email sequence that frames our offering around the
+specific needs of this company based on the research and signals below.
+
+Rules:
+- Keep each email under 150 words
+- Be conversational, NOT salesy — sound like a peer, not a vendor
+- Reference the specific signal or discovery that triggered outreach
+- Reference one specific pain point from the research
+- Don't use generic phrases like "I hope this finds you well"
+- Frame our offering as solving THEIR specific problem
+- Include a clear, low-friction CTA (e.g., "Worth a quick chat?")
+- Follow-ups should add new value, not just "checking in"
+- Use the decision maker's first name
+- Adapt tone to the role (e.g., technical for CTO, business-focused for CEO)
+
+Respond with ONLY a JSON object containing:
+- "subject": string (email subject line, short and curiosity-driving)
+- "body": string (initial email body, use \\n for line breaks)
+- "followup_1_subject": string
+- "followup_1_body": string (different angle, new value)
+- "followup_2_subject": string
+- "followup_2_body": string (breakup email, last attempt)
+"""
+
+
 def _get_or_create_campaign(session) -> Campaign:
     """Get active campaign or create default."""
     campaign = session.query(Campaign).filter_by(is_active=1).first()
@@ -59,6 +103,15 @@ def run(dry_run: bool = False):
     """Generate emails for all companies with status RESEARCH_DONE."""
     init_db()
     log.info("Starting email writer...")
+
+    # Inject debug contact (umar.mohamed@zansphere.com) into all active campaigns
+    # so it always receives test emails regardless of pipeline state.
+    if not dry_run:
+        try:
+            with get_session() as session:
+                inject_debug_contact_for_all_campaigns(session)
+        except Exception as e:
+            log.warning(f"Debug contact injection failed (non-fatal): {e}")
 
     with get_session() as session:
         companies = session.query(Company).filter_by(status="RESEARCH_DONE").all()
@@ -78,6 +131,8 @@ def run(dry_run: bool = False):
             company_industry = company.industry or "Unknown"
             company_country = company.country or "Unknown"
             company_employees = company.employee_count or "Unknown"
+            company_campaign_id = company.campaign_id
+            company_signal_source = company.signal_source or "unknown"
 
             log.info(f"Writing emails for: {company_name}")
 
@@ -85,10 +140,37 @@ def run(dry_run: bool = False):
                 log.info(f"  [DRY RUN] Would generate emails for {company_name}")
                 continue
 
+            # Load campaign-specific prompt
+            campaign = None
+            if company_campaign_id:
+                campaign = session.query(Campaign).filter_by(id=company_campaign_id).first()
+
+            if campaign:
+                system_prompt = _build_campaign_email_prompt(campaign)
+                log.info(f"  Using campaign prompt: '{campaign.name}'")
+            else:
+                system_prompt = EMAIL_PROMPT_DEFAULT
+                log.info("  Using default email prompt")
+
+            # Accept any contact that has a real email address
+            _ACCEPTED_VERIFIED = [
+                "PROSPEO_VERIFIED", "VALID", "APIFY_VERIFIED", "APOLLO_VERIFIED",
+                "SMTP_VERIFIED", "WEB_SCRAPED", "PATTERN_ACCEPTED",
+            ]
             contact = (
                 session.query(Contact)
                 .filter_by(company_id=cid)
-                .filter(Contact.verified.in_(["VALID", "APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED", "PATTERN_ACCEPTED"]))
+                .filter(
+                    Contact.verified.in_(_ACCEPTED_VERIFIED)
+                    | (
+                        (Contact.email != None) &
+                        (Contact.email != "") &
+                        (Contact.verified != "NOT_FOUND")
+                    )
+                )
+                .order_by(
+                    Contact.verified.in_(_ACCEPTED_VERIFIED).desc()
+                )
                 .first()
             )
             if not contact:
@@ -109,6 +191,10 @@ def run(dry_run: bool = False):
             tech_stack = safe_json_loads(research.tech_stack) or []
             recent_news = research.recent_news or ""
 
+            # Get campaign fit notes if available
+            raw_data = safe_json_loads(research.raw_json) or {}
+            campaign_fit = raw_data.get("campaign_fit_notes", "")
+
         # Step 2: Call LLM outside of database transaction
         try:
             first_name = contact_name.split()[0] if contact_name else "there"
@@ -123,25 +209,34 @@ Company:
 - Industry: {company_industry}
 - Country: {company_country}
 - Employee Count: {company_employees}
+- Discovery Source: {company_signal_source}
 
 Research:
 - Summary: {research_summary}
 - Pain Points: {', '.join(pain_points[:3]) if pain_points else 'N/A'}
 - Tech Stack: {', '.join(tech_stack[:5]) if tech_stack else 'N/A'}
 - Recent News: {recent_news or 'N/A'}
+{f'- Campaign Fit: {campaign_fit}' if campaign_fit else ''}
 
-Signal that triggered outreach: {recent_news or 'hiring engineers'}
+Signal that triggered outreach: {recent_news or f'Discovered via {company_signal_source}'}
 """
 
             data = call_llm_with_schema(
-                system_prompt=EMAIL_PROMPT,
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 required_keys=["subject", "body", "followup_1_body", "followup_2_body"],
             )
 
-            # Step 3: Write emails and update company status in a fast isolated transaction
+            # Step 3: Write emails and update company status
             with get_session() as session:
-                campaign = _get_or_create_campaign(session)
+                # Use the company's campaign or get/create one
+                if company_campaign_id:
+                    campaign_obj = session.query(Campaign).filter_by(id=company_campaign_id).first()
+                    if not campaign_obj:
+                        campaign_obj = _get_or_create_campaign(session)
+                else:
+                    campaign_obj = _get_or_create_campaign(session)
+
                 now = utcnow()
 
                 subj = data["subject"]
@@ -153,7 +248,7 @@ Signal that triggered outreach: {recent_news or 'hiring engineers'}
                         "sequence_number": 0,
                         "subject": subj,
                         "body": data["body"],
-                        "scheduled_at": now,  # Send immediately
+                        "scheduled_at": now,
                     },
                     {
                         "sequence_number": 1,
@@ -173,12 +268,13 @@ Signal that triggered outreach: {recent_news or 'hiring engineers'}
                     email = Email(
                         company_id=cid,
                         contact_id=contact_id,
-                        campaign_id=campaign.id,
+                        campaign_id=campaign_obj.id,
                         sequence_number=email_data["sequence_number"],
                         subject=email_data["subject"],
                         body=email_data["body"],
                         status="SCHEDULED",
                         scheduled_at=email_data["scheduled_at"],
+                        unsubscribe_token=generate_unsubscribe_token(),
                     )
                     session.add(email)
 
@@ -203,3 +299,4 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"Email writer failed: {e}", exc_info=True)
         sys.exit(1)
+

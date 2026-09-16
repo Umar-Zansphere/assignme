@@ -12,6 +12,14 @@ streamlit>=1.35,<2.0
 # Email
 # (stdlib: smtplib, imaplib, email — no extra deps)
 
+# Unsubscribe server
+flask>=3.0,<4.0
+
+# Google OAuth + Gmail API
+google-auth>=2.0,<3.0
+google-auth-oauthlib>=1.0,<2.0
+google-api-python-client>=2.0,<3.0
+
 # Email Verification
 dnspython>=2.6,<3.0
 

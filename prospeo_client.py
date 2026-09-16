@@ -105,21 +105,27 @@ def _post(endpoint: str, payload: dict) -> dict:
     return {"error": True, "error_code": "REQUEST_FAILED", "message": last_error}
 
 
-# ── Email Finder ──────────────────────────────────────────
+# ── Email Finder (via Enrich Person) ─────────────────────
 
 def find_email(first_name: str, last_name: str, domain: str) -> dict:
     """
     Find a verified email for a person at a company domain via Prospeo.
 
+    Uses the /enrich-person endpoint as documented at:
+    https://prospeo.io/api-docs/enrich-person
+
+    Payload: { "data": { "first_name", "last_name", "company_website" } }
+    Response email is nested at: person.email.email
+
     Args:
         first_name: Person's first name.
         last_name: Person's last name.
-        domain: Company domain (e.g., "intercom.com").
+        domain: Company root domain (e.g., "intercom.com").
 
     Returns:
         dict with keys:
             - "email": str — verified email or ""
-            - "status": str — "verified", "catch-all", "not_found", "error"
+            - "status": str — "VALID", "catch-all", "not_found", "error"
             - "confidence": int — 0-100
             - "catch_all": bool — True if domain is catch-all
             - "source": str — "PROSPEO_VERIFIED", "PROSPEO_CATCH_ALL", "NOT_FOUND"
@@ -135,63 +141,129 @@ def find_email(first_name: str, last_name: str, domain: str) -> dict:
     log.info(f"Prospeo email lookup: {first_name} {last_name} @ {domain}")
 
     payload = {
-        "first_name": first_name.strip(),
-        "last_name": last_name.strip(),
-        "company": domain.strip().lower(),
+        "only_verified_email": False,
+        "data": {
+            "first_name":      first_name.strip(),
+            "last_name":       last_name.strip(),
+            "company_website": domain.strip().lower(),
+        },
     }
 
-    data = _post("email-finder", payload)
+    data = _post("enrich-person", payload)
 
     # Handle error responses
     if data.get("error"):
-        error_code = data.get("error_code", "UNKNOWN")
+        error_code = data.get("error_code", str(data.get("error", "UNKNOWN")))
         log.info(f"  Prospeo returned error: {error_code}")
         return _empty_result(raw=data)
 
-    # Parse successful response
-    email = (data.get("email") or "").strip().lower()
-    email_status = (data.get("email_status") or "").lower()
+    # Response structure: data.person.email.email / data.person.email.status
+    person = data.get("person") or {}
+    email_obj = person.get("email") or {}
+
+    email = (email_obj.get("email") or "").strip().lower()
+    email_status = (email_obj.get("status") or "").upper()  # "VALID", "CATCH_ALL", etc.
 
     if not email:
         log.info(f"  Prospeo found no email for {first_name} {last_name} @ {domain}")
         return _empty_result(raw=data)
 
     # Determine verification status
-    is_catch_all = email_status == "catch-all" or data.get("catch_all", False)
+    # Prospeo returns status: "VERIFIED" (good), "CATCH_ALL", "RISKY", "INVALID"
+    is_catch_all = email_status != "VERIFIED"
 
     if is_catch_all:
         source = "PROSPEO_CATCH_ALL"
-        log.info(f"  [CATCH-ALL] Prospeo found: {email} (catch-all domain)")
+        log.info(f"  [CATCH-ALL] Prospeo found: {email} (status={email_status})")
     else:
         source = "PROSPEO_VERIFIED"
-        log.info(f"  [VERIFIED] Prospeo found: {email}")
-
-    confidence = data.get("confidence", 0)
-    if isinstance(confidence, str):
-        try:
-            confidence = int(confidence)
-        except (ValueError, TypeError):
-            confidence = 0
+        log.info(f"  [VERIFIED] Prospeo found: {email} (status={email_status})")
 
     return {
-        "email": email,
-        "status": email_status or "verified",
-        "confidence": confidence,
-        "catch_all": is_catch_all,
-        "source": source,
-        "raw": data,
+        "email":      email,
+        "status":     email_status or "VERIFIED",
+        "confidence": 100,
+        "catch_all":  is_catch_all,
+        "source":     source,
+        "raw":        data,
+        # ── Rich enrichment data extracted from the response ──
+        "enrichment": _extract_enrichment(data),
     }
+
+
+def _extract_enrichment(data: dict) -> dict:
+    """
+    Extract all valuable data from a Prospeo /enrich-person response.
+
+    Returns a flat dict with contact-level and company-level fields
+    that can be stored directly against Contact and Company models.
+    """
+    person  = data.get("person")  or {}
+    company = data.get("company") or {}
+
+    # ── Contact-level ──────────────────────────────────────
+    location_p = person.get("location") or {}
+    contact = {
+        "headline":   (person.get("headline") or "").strip(),
+        "timezone":   location_p.get("time_zone") or "",       # "America/New_York"
+        "city":       location_p.get("city") or "",
+        "prospeo_id": person.get("linkedin_member_id") or "",
+        # Current job title from Prospeo (may be richer than the LLM-extracted role)
+        "current_job_title": (person.get("current_job_title") or "").strip(),
+        # LinkedIn URL as confirmed by Prospeo
+        "linkedin_url": (person.get("linkedin_url") or "").strip(),
+    }
+
+    # ── Company-level ──────────────────────────────────────
+    tech      = company.get("technology") or {}
+    jobs      = company.get("job_postings") or {}
+    funding   = company.get("funding") or {}
+    attrs     = company.get("attributes") or {}
+    location_c = company.get("location") or {}
+
+    tech_names  = tech.get("technology_names") or []
+    job_titles  = jobs.get("active_titles") or []
+    keywords    = company.get("keywords") or []
+
+    # Funding stage: prefer Prospeo's stage string; fall back to round name
+    funding_stage = (
+        funding.get("stage")
+        or funding.get("last_round_type")
+        or ""
+    )
+    if isinstance(funding_stage, dict):
+        funding_stage = funding_stage.get("name") or ""
+
+    company_data = {
+        "description_ai":   (company.get("description_ai") or "").strip(),
+        "tech_stack":       tech_names[:30],            # list[str], cap at 30
+        "active_job_titles": job_titles[:50],           # list[str], cap at 50
+        "active_job_count": jobs.get("active_count") or 0,
+        "keywords":         keywords[:20],              # list[str]
+        "funding_stage":    funding_stage,
+        "revenue_range":    company.get("revenue_range_printed") or "",
+        "is_b2b":           1 if attrs.get("is_b2b") else 0,
+        # Fresher employee count from Prospeo (LinkedIn is often stale)
+        "employee_count":   company.get("employee_count") or 0,
+        # Industry from Prospeo (may be more granular than LinkedIn's)
+        "industry":         (company.get("industry") or "").strip(),
+        # Company location
+        "country":          location_c.get("country") or "",
+        "city":             location_c.get("city") or "",
+    }
+
+    return {"contact": contact, "company": company_data}
 
 
 def _empty_result(raw: dict | None = None) -> dict:
     """Return a standardized empty/not-found result."""
     return {
-        "email": "",
-        "status": "not_found",
+        "email":      "",
+        "status":     "not_found",
         "confidence": 0,
-        "catch_all": False,
-        "source": "NOT_FOUND",
-        "raw": raw or {},
+        "catch_all":  False,
+        "source":     "NOT_FOUND",
+        "raw":        raw or {},
     }
 
 

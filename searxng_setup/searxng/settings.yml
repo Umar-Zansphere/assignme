@@ -1,0 +1,33 @@
+use_default_settings: true
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "super_secret_sales_machine_key"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  # IMPORTANT: The formats list MUST include 'json' to allow our pipeline to query it via API
+  formats:
+    - html
+    - json
+
+engines:
+  # General Search
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+    
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+    

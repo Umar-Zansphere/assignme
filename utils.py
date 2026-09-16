@@ -33,18 +33,22 @@ def get_logger(name: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Console handler
-    console = logging.StreamHandler()
+    # Console handler — force UTF-8 so Unicode chars (✓ ✗ etc.) don't crash
+    # on Windows terminals that default to cp1252.
+    import sys
+    utf8_stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1, closefd=False)
+    console = logging.StreamHandler(stream=utf8_stdout)
     console.setFormatter(formatter)
     logger.addHandler(console)
 
-    # File handler (rotating, 10MB max, keep 5 backups)
+    # File handler (rotating, 10MB max, keep 5 backups) — always UTF-8
     log_dir = os.path.dirname(LOG_FILE)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
     file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5,
+        encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
@@ -71,6 +75,9 @@ def retry(max_attempts: int = 3, base_delay: float = 1.0, backoff: float = 2.0):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
+                    # Do not swallow Streamlit's internal control exceptions
+                    if type(e).__name__ in ('StopException', 'ScriptControlException', 'RerunException', 'KeyboardInterrupt'):
+                        raise e
                     last_exception = e
                     if attempt < max_attempts:
                         delay = base_delay * (backoff ** (attempt - 1))
@@ -78,7 +85,11 @@ def retry(max_attempts: int = 3, base_delay: float = 1.0, backoff: float = 2.0):
                             f"{func.__name__} attempt {attempt}/{max_attempts} failed: {e}. "
                             f"Retrying in {delay:.1f}s..."
                         )
-                        time.sleep(delay)
+                        # Sleep in small increments so Ctrl+C / Streamlit stop can interrupt
+                        elapsed = 0.0
+                        while elapsed < delay:
+                            time.sleep(min(0.5, delay - elapsed))
+                            elapsed += 0.5
                     else:
                         logger.error(
                             f"{func.__name__} failed after {max_attempts} attempts: {e}"
@@ -123,7 +134,7 @@ def safe_json_dumps(obj) -> str:
 
 # ── Domain Extraction ─────────────────────────────────────
 def extract_domain(url: str) -> str:
-    """Extract root domain from URL. e.g. 'https://www.example.com/about' → 'example.com'"""
+    """Extract root domain from URL. e.g. 'https://careers.example.com/about' → 'example.com'"""
     if not url:
         return ""
     url = url.lower().strip()
@@ -133,6 +144,15 @@ def extract_domain(url: str) -> str:
             url = url[len(prefix):]
     # Remove path
     url = url.split("/")[0]
+    # Strip known non-root subdomains so Prospeo gets the real company domain
+    _NON_ROOT = (
+        "careers.", "jobs.", "hire.", "hiring.", "work.", "apply.",
+        "talent.", "recruit.", "about.", "mail.", "blog.",
+    )
+    for sub in _NON_ROOT:
+        if url.startswith(sub):
+            url = url[len(sub):]
+            break
     return url
 
 

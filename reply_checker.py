@@ -1,9 +1,12 @@
 """
 reply_checker.py — Stage 9: Reply Checker
 
-Connects to inbox via IMAP, detects replies to sent emails
-by matching In-Reply-To / References headers with stored Message-IDs.
+Connects to inbox via IMAP for each active mailbox, detects replies to sent
+emails by matching In-Reply-To / References headers with stored Message-IDs.
 Marks companies as REPLIED and cancels pending follow-ups.
+
+Multi-mailbox: iterates over all active mailboxes with IMAP credentials
+configured, rather than using a single global IMAP account.
 
 Usage:
     python reply_checker.py
@@ -16,8 +19,8 @@ import email as email_lib
 from email.header import decode_header
 
 from database import get_session, init_db
-from models import Email, Company, Contact, ReplyLog
-from config import IMAP_HOST, IMAP_PORT, IMAP_USERNAME, IMAP_PASSWORD
+from models import Email, Company, Contact, ReplyLog, Mailbox
+from event_processor import record_reply
 from utils import get_logger, utcnow
 
 log = get_logger("reply_checker")
@@ -60,36 +63,120 @@ def _get_body(msg) -> str:
     return ""
 
 
-def fetch_replies(sent_message_ids: set[str]) -> list[dict]:
+def fetch_replies_for_mailbox(
+    mailbox: Mailbox,
+    sent_message_ids: set[str],
+) -> list[dict]:
     """
-    Connect to IMAP inbox and find replies to our sent emails.
+    Connect to inbox for a specific mailbox and find replies
+    to our sent emails.
+
+    For Google OAuth mailboxes: uses the Gmail API (no IMAP password needed).
+    For SMTP mailboxes: uses IMAP (traditional approach).
 
     Args:
-        sent_message_ids: Set of Message-IDs we've sent.
+        mailbox: The Mailbox model with credentials
+        sent_message_ids: Set of Message-IDs we've sent
 
     Returns:
-        List of reply dicts with keys: in_reply_to, from, subject, body
+        List of reply dicts with keys: in_reply_to, from, subject, body, mailbox_id
     """
-    if not IMAP_USERNAME or not IMAP_PASSWORD:
-        log.error("IMAP credentials not configured")
+    # Use Gmail API for OAuth-connected Google mailboxes
+    if (
+        mailbox.provider == "google"
+        and mailbox.oauth_connected
+        and mailbox.oauth_refresh_token
+    ):
+        return _fetch_replies_gmail_api(mailbox, sent_message_ids)
+
+    # Fall back to IMAP for SMTP mailboxes
+    return _fetch_replies_imap(mailbox, sent_message_ids)
+
+
+def _fetch_replies_gmail_api(
+    mailbox: Mailbox,
+    sent_message_ids: set[str],
+) -> list[dict]:
+    """Fetch replies using the Gmail API for OAuth-connected mailboxes."""
+    try:
+        from google_oauth import list_recent_messages, get_message, get_message_headers, get_message_body
+
+        log.info(f"Checking replies via Gmail API for {mailbox.email}")
+        messages = list_recent_messages(mailbox, max_results=100)
+        log.info(f"  {len(messages)} recent messages in inbox")
+
+        replies = []
+        for msg_stub in messages:
+            msg = get_message(mailbox, msg_stub["id"])
+            if not msg:
+                continue
+
+            headers = get_message_headers(msg)
+
+            in_reply_to = headers.get("in-reply-to", "").strip()
+            references = headers.get("references", "").strip()
+
+            # Match against our sent Message-IDs
+            matched_id = None
+            if in_reply_to in sent_message_ids:
+                matched_id = in_reply_to
+            else:
+                for ref in references.split():
+                    ref = ref.strip()
+                    if ref in sent_message_ids:
+                        matched_id = ref
+                        break
+
+            if matched_id:
+                body = get_message_body(msg)
+                replies.append({
+                    "in_reply_to": matched_id,
+                    "from": headers.get("from", ""),
+                    "subject": headers.get("subject", ""),
+                    "body": body[:2000],
+                    "mailbox_id": mailbox.id,
+                })
+
+        log.info(f"  Found {len(replies)} replies via Gmail API")
+        return replies
+
+    except Exception as e:
+        log.error(f"Gmail API reply check failed for {mailbox.email}: {e}")
+        return []
+
+
+def _fetch_replies_imap(
+    mailbox: Mailbox,
+    sent_message_ids: set[str],
+) -> list[dict]:
+    """Fetch replies using IMAP for SMTP mailboxes."""
+    imap_host = mailbox.imap_host
+    imap_port = mailbox.imap_port or 993
+    imap_user = mailbox.imap_username or mailbox.smtp_username
+    imap_pass = mailbox.imap_password or mailbox.smtp_password
+
+    if not imap_host or not imap_user or not imap_pass:
+        log.debug(f"No IMAP credentials for mailbox {mailbox.email}, skipping")
         return []
 
     replies = []
 
     try:
-        log.info(f"Connecting to IMAP: {IMAP_HOST}:{IMAP_PORT}")
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-        mail.login(IMAP_USERNAME, IMAP_PASSWORD)
+        log.info(f"Checking replies for mailbox {mailbox.email} ({imap_host}:{imap_port})")
+        mail = imaplib.IMAP4_SSL(imap_host, imap_port)
+        mail.login(imap_user, imap_pass)
         mail.select("INBOX")
 
+        import datetime
         # Search for recent emails (last 7 days)
-        status, data = mail.search(None, "(SINCE 7-DAYS-AGO)")
+        date_since = (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%d-%b-%Y")
+        status, data = mail.search(None, f'(SINCE "{date_since}")')
         if status != "OK":
-            log.warning("IMAP search failed")
+            log.warning(f"IMAP search failed for {mailbox.email}")
             return []
 
         msg_nums = data[0].split()
-        log.info(f"Checking {len(msg_nums)} recent emails for replies")
+        log.info(f"  Checking {len(msg_nums)} recent emails")
 
         for num in msg_nums:
             status, msg_data = mail.fetch(num, "(RFC822)")
@@ -119,20 +206,21 @@ def fetch_replies(sent_message_ids: set[str]) -> list[dict]:
                     "from": _get_header(msg, "From"),
                     "subject": _get_header(msg, "Subject"),
                     "body": _get_body(msg)[:2000],  # Truncate body
+                    "mailbox_id": mailbox.id,
                 })
 
         mail.logout()
 
     except imaplib.IMAP4.error as e:
-        log.error(f"IMAP error: {e}")
+        log.error(f"IMAP error for {mailbox.email}: {e}")
     except Exception as e:
-        log.error(f"Error checking replies: {e}")
+        log.error(f"Error checking replies for {mailbox.email}: {e}")
 
     return replies
 
 
 def run(dry_run: bool = False):
-    """Check for replies and update company statuses."""
+    """Check for replies across all active mailboxes and update company statuses."""
     init_db()
     log.info("Starting reply checker...")
 
@@ -162,11 +250,36 @@ def run(dry_run: bool = False):
             log.info("[DRY RUN] Would connect to IMAP and check for replies")
             return
 
-        # Fetch replies
-        replies = fetch_replies(set(msg_id_lookup.keys()))
-        log.info(f"Found {len(replies)} replies")
+        from sqlalchemy import or_
 
-        for reply in replies:
+        # Get all active mailboxes with IMAP or OAuth credentials
+        mailboxes = (
+            session.query(Mailbox)
+            .filter_by(is_active=1)
+            .filter(
+                or_(
+                    (Mailbox.imap_host.isnot(None)) & (Mailbox.imap_username.isnot(None) | Mailbox.smtp_username.isnot(None)),
+                    (Mailbox.oauth_connected == 1) & (Mailbox.oauth_refresh_token.isnot(None))
+                )
+            )
+            .all()
+        )
+
+        if not mailboxes:
+            log.warning("No mailboxes with IMAP/OAuth credentials configured")
+            return
+
+        log.info(f"Checking {len(mailboxes)} mailbox(es) for replies")
+
+        # Fetch replies from all mailboxes
+        all_replies = []
+        for mailbox in mailboxes:
+            replies = fetch_replies_for_mailbox(mailbox, set(msg_id_lookup.keys()))
+            all_replies.extend(replies)
+
+        log.info(f"Found {len(all_replies)} replies total")
+
+        for reply in all_replies:
             matched_email = msg_id_lookup.get(reply["in_reply_to"])
             if not matched_email:
                 continue
@@ -197,6 +310,11 @@ def run(dry_run: bool = False):
 
             log.info(f"  [OK] Reply detected from {reply['from']}: {reply['subject']}")
 
+            # Record reply event for health tracking
+            mailbox_id = reply.get("mailbox_id") or matched_email.mailbox_id
+            if mailbox_id:
+                record_reply(session, matched_email.id, mailbox_id)
+
             # Update company status
             company = session.query(Company).filter_by(id=matched_email.company_id).first()
             if company:
@@ -214,6 +332,7 @@ def run(dry_run: bool = False):
             )
             for pending_email in pending:
                 pending_email.status = "CANCELLED"
+                pending_email.blocked_reason = "COMPANY_REPLIED"
                 log.info(f"  Cancelled follow-up email #{pending_email.id}")
 
         log.info("Reply checking complete")
