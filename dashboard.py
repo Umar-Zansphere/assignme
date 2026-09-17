@@ -15,6 +15,7 @@ Usage:
 import json
 import os
 import sys
+import time
 import subprocess
 import streamlit as st
 import pandas as pd
@@ -219,7 +220,7 @@ STAGE_SCRIPTS = {
 def run_stage(script_name: str, campaign_id: int | None = None) -> tuple[str, str, int]:
     """Run a pipeline stage script and return (stdout, stderr, returncode)."""
     cmd = [sys.executable, os.path.join(BASE_DIR, script_name)]
-    if campaign_id and script_name == "watcher.py":
+    if campaign_id:
         cmd.append(f"--campaign-id={campaign_id}")
 
     try:
@@ -283,7 +284,7 @@ def load_stats(campaign_id: int | None = None):
             "rejected":          base_q.filter_by(status="REJECTED").count(),
             "contacts_found":    s.query(Contact).count(),
             "contacts_verified": s.query(Contact).filter(Contact.verified.in_(
-                                   ["PROSPEO_VERIFIED", "VALID", "PATTERN_ACCEPTED",
+                                   ["PROSPEO_VERIFIED", "FULLENRICH_VERIFIED", "VALID", "PATTERN_ACCEPTED",
                                     "SMTP_VERIFIED", "WEB_SCRAPED", "APOLLO_VERIFIED"])).count(),
             "contacts_no_email": s.query(Contact).filter(
                                    (Contact.email == None) | (Contact.email == "")).count(),
@@ -339,13 +340,20 @@ def load_stats(campaign_id: int | None = None):
 def load_campaigns():
     init_db()
     with get_session() as s:
-        campaigns = s.query(Campaign).order_by(Campaign.created_at.desc()).all()
+        campaigns = (
+            s.query(Campaign)
+            .filter(Campaign.deleted_at.is_(None))
+            .order_by(Campaign.created_at.desc())
+            .all()
+        )
         return [{
             "id": c.id,
             "name": c.name,
             "brief": c.brief or "",
+            "status": c.status or "ACTIVE",
             "is_active": c.is_active,
             "sources": c.source_selection or "[]",
+            "target_verified_emails": c.target_verified_emails,
             "created_at": c.created_at,
         } for c in campaigns]
 
@@ -358,6 +366,14 @@ def load_companies(campaign_id: int | None = None):
         if campaign_id:
             q = q.filter_by(campaign_id=campaign_id)
         cos = q.all()
+        
+        if not cos:
+            return pd.DataFrame(columns=[
+                "ID", "Name", "Industry", "Country", "Employees", 
+                "ICP Score", "Status", "Channel", "Source", "Website", 
+                "Phone", "LinkedIn"
+            ])
+            
         return pd.DataFrame([{
             "ID":        c.id,
             "Name":      c.name,
@@ -489,9 +505,11 @@ def status_pill(status: str) -> str:
 def email_source_badge(source: str) -> str:
     if source in ("PROSPEO_VERIFIED",):
         return '<span class="badge-apify">✅ PROSPEO VERIFIED</span>'
+    elif source in ("FULLENRICH_VERIFIED",):
+        return '<span class="badge-apify">✅ FULLENRICH VERIFIED</span>'
     elif source in ("APOLLO_VERIFIED",):
         return '<span class="badge-apify">✅ APOLLO VERIFIED</span>'
-    elif source in ("PROSPEO_CATCH_ALL",):
+    elif source in ("PROSPEO_CATCH_ALL", "FULLENRICH_CATCH_ALL"):
         return '<span class="badge-guessed">📫 CATCH-ALL</span>'
     elif source in ("PATTERN_ACCEPTED", "VALID", "SMTP_VERIFIED", "WEB_SCRAPED"):
         return '<span class="badge-apify">✅ VERIFIED</span>'
@@ -668,23 +686,97 @@ elif page == "🎯 Campaign Builder":
     st.title("Campaign Builder")
     st.caption("Create a new campaign from a natural language brief — the LLM generates the config, you review & edit.")
 
-    # ── Existing campaigns ──
+    # ── Existing campaigns with CRUD ──
     if campaigns:
-        st.subheader("📋 Existing Campaigns")
+        st.subheader("Existing Campaigns")
         for camp in campaigns:
             sources = json.loads(camp["sources"]) if camp["sources"] else []
-            status_icon = "🟢" if camp["is_active"] else "🔴"
-            st.markdown(
-                f'<div class="campaign-card">'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-                f'<span style="font-size:1.05rem;font-weight:700;color:#e2e8f0;">{status_icon} {camp["name"]}</span>'
-                f'<span style="color:#718096;font-size:0.78rem;">#{camp["id"]} • {camp["created_at"]}</span>'
-                f'</div>'
-                f'<div style="color:#a0aec0;font-size:0.82rem;margin-top:8px;">{camp["brief"][:200] if camp["brief"] else "No brief"}</div>'
-                f'<div style="margin-top:8px;">{source_pills_html({s: "✓" for s in sources})}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            status_map = {"ACTIVE": ("🟢", "#48bb78"), "PAUSED": ("⏸️", "#ed8936"), "COMPLETED": ("✅", "#667eea"), "ARCHIVED": ("🗄️", "#718096")}
+            s_icon, s_color = status_map.get(camp["status"], ("❓", "#718096"))
+            
+            col_info, col_actions = st.columns([4, 2])
+            with col_info:
+                cap_text = f" | Cap: {camp['target_verified_emails']} emails" if camp.get("target_verified_emails") else ""
+                st.markdown(
+                    f'<div class="campaign-card">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                    f'<span style="font-size:1.05rem;font-weight:700;color:#e2e8f0;">{s_icon} {camp["name"]}</span>'
+                    f'<span style="background:{s_color}33;color:{s_color};padding:2px 10px;border-radius:12px;font-size:0.72rem;font-weight:600;">{camp["status"]}</span>'
+                    f'</div>'
+                    f'<div style="color:#a0aec0;font-size:0.82rem;margin-top:8px;">{camp["brief"][:200] if camp["brief"] else "No brief"}{cap_text}</div>'
+                    f'<div style="margin-top:8px;">{source_pills_html({s: "ok" for s in sources})}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with col_actions:
+                # Pause / Resume
+                if camp["status"] == "ACTIVE":
+                    if st.button("Pause", key=f"pause_{camp['id']}", use_container_width=True):
+                        with get_session() as s:
+                            c = s.query(Campaign).filter_by(id=camp["id"]).first()
+                            if c:
+                                c.status = "PAUSED"
+                                c.is_active = 0
+                        st.cache_data.clear()
+                        st.rerun()
+                elif camp["status"] == "PAUSED":
+                    if st.button("Resume", key=f"resume_{camp['id']}", use_container_width=True):
+                        with get_session() as s:
+                            c = s.query(Campaign).filter_by(id=camp["id"]).first()
+                            if c:
+                                c.status = "ACTIVE"
+                                c.is_active = 1
+                        st.cache_data.clear()
+                        st.rerun()
+                
+                # Edit button
+                if st.button("Edit", key=f"edit_{camp['id']}", use_container_width=True):
+                    # Load full campaign config into session state for editing
+                    with get_session() as s:
+                        c = s.query(Campaign).filter_by(id=camp["id"]).first()
+                        if c:
+                            from utils import safe_json_loads
+                            edit_config = {
+                                "name": c.name,
+                                "target_industries": safe_json_loads(c.target_industries) or [],
+                                "target_geography": safe_json_loads(c.target_geography) or [],
+                                "target_company_size": c.target_company_size or "1-500",
+                                "target_roles": safe_json_loads(c.target_roles) or [],
+                                "target_verified_emails": c.target_verified_emails,
+                                "source_selection": safe_json_loads(c.source_selection) or [],
+                                "search_queries": safe_json_loads(c.search_queries) or {},
+                                "scoring_rules": safe_json_loads(c.scoring_rules) or [],
+                                "scoring_threshold": c.scoring_threshold or 60,
+                                "exclusion_list": safe_json_loads(c.exclusion_list) or [],
+                                "our_offering": c.our_offering or "",
+                                "value_proposition": c.value_proposition or "",
+                                "pitch_angle": c.pitch_angle or "",
+                                "research_questions": safe_json_loads(c.research_questions) or [],
+                            }
+                            st.session_state["campaign_config"] = edit_config
+                            st.session_state["campaign_brief"] = c.brief or ""
+                            st.session_state["editing_campaign_id"] = c.id
+                    st.rerun()
+                
+                # Delete button
+                if st.button("Delete", key=f"del_{camp['id']}", type="secondary", use_container_width=True):
+                    st.session_state[f"confirm_delete_{camp['id']}"] = True
+                
+                if st.session_state.get(f"confirm_delete_{camp['id']}"):
+                    st.warning(f"Delete **{camp['name']}**?")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("Yes", key=f"yes_del_{camp['id']}"):
+                            from campaign_builder import soft_delete_campaign
+                            with get_session() as s:
+                                soft_delete_campaign(s, camp["id"])
+                            del st.session_state[f"confirm_delete_{camp['id']}"]
+                            st.cache_data.clear()
+                            st.rerun()
+                    with c2:
+                        if st.button("No", key=f"no_del_{camp['id']}"):
+                            del st.session_state[f"confirm_delete_{camp['id']}"]
+                            st.rerun()
         st.divider()
 
     # ── Create new campaign ──
@@ -758,28 +850,33 @@ elif page == "🎯 Campaign Builder":
                 # Combine builtin with any custom sources generated by the LLM
                 all_sources = list(set(builtin_sources + current_sources))
                 
+                def format_source(source_key):
+                    if source_key in app_config.AVAILABLE_DATA_SOURCES:
+                        data = app_config.AVAILABLE_DATA_SOURCES[source_key]
+                        return f"{data['name']} - {data['description']}"
+                    return source_key
+                
                 selected_sources = st.multiselect(
                     "Data Sources",
                     all_sources,
                     default=current_sources,
+                    format_func=format_source,
                 )
                 
-                custom_sources_input = st.text_input(
-                    "Additional Custom Sources (comma separated, e.g. upwork)",
-                    help="Added sources will dynamically appear in the Search Queries section below."
-                )
-                
-                if custom_sources_input:
-                    for s in custom_sources_input.split(","):
-                        s = s.strip().lower()
-                        if s and s not in selected_sources:
-                            selected_sources.append(s)
                 # Scoring threshold
                 threshold = st.number_input(
                     "Scoring Threshold",
                     value=config.get("scoring_threshold", 60),
                     min_value=0, max_value=200,
                 )
+                
+                # Target verified emails cap
+                target_verified_emails = st.number_input(
+                    "Target Verified Emails (0 = unlimited)",
+                    value=config.get("target_verified_emails", 0) or 0,
+                    min_value=0, step=10,
+                )
+                target_verified_emails = None if target_verified_emails == 0 else target_verified_emails
 
             st.markdown("---")
 
@@ -842,7 +939,9 @@ elif page == "🎯 Campaign Builder":
                 height=60,
             )
 
-            submitted = st.form_submit_button("✅ Create Campaign", use_container_width=True)
+            is_editing = "editing_campaign_id" in st.session_state
+            btn_label = "💾 Save Changes" if is_editing else "✅ Create Campaign"
+            submitted = st.form_submit_button(btn_label, use_container_width=True)
 
             if submitted:
                 try:
@@ -856,6 +955,7 @@ elif page == "🎯 Campaign Builder":
                     "target_geography": [g.strip() for g in geography.split("\n") if g.strip()],
                     "target_company_size": company_size,
                     "target_roles": [r.strip() for r in roles.split("\n") if r.strip()],
+                    "target_verified_emails": target_verified_emails,
                     "source_selection": selected_sources,
                     "search_queries": search_queries,
                     "scoring_rules": parsed_rules,
@@ -868,22 +968,36 @@ elif page == "🎯 Campaign Builder":
                 }
 
                 try:
-                    from campaign_builder import create_campaign_from_config
                     with get_session() as session:
-                        campaign = create_campaign_from_config(
-                            session,
-                            final_config,
-                            st.session_state.get("campaign_brief", brief),
-                        )
-                        campaign_id = campaign.id
+                        if is_editing:
+                            from campaign_builder import update_campaign_from_config
+                            campaign_id = st.session_state["editing_campaign_id"]
+                            campaign = update_campaign_from_config(session, campaign_id, final_config)
+                            msg = f"🎉 Campaign **'{name}'** updated!"
+                        else:
+                            from campaign_builder import create_campaign_from_config
+                            campaign = create_campaign_from_config(
+                                session,
+                                final_config,
+                                st.session_state.get("campaign_brief", brief),
+                            )
+                            campaign_id = campaign.id
+                            msg = f"🎉 Campaign **'{name}'** created (#{campaign_id})! You can now run the Watcher."
 
-                    st.success(f"🎉 Campaign **'{name}'** created (#{campaign_id})! You can now run the Watcher.")
-                    del st.session_state["campaign_config"]
-                    del st.session_state["campaign_brief"]
+                    st.success(msg)
+                    
+                    # Clear session state
+                    if "campaign_config" in st.session_state:
+                        del st.session_state["campaign_config"]
+                    if "campaign_brief" in st.session_state:
+                        del st.session_state["campaign_brief"]
+                    if "editing_campaign_id" in st.session_state:
+                        del st.session_state["editing_campaign_id"]
+                        
                     st.cache_data.clear()
                     st.rerun()
                 except Exception as e:
-                    st.error(f"❌ Failed to create campaign: {e}")
+                    st.error(f"❌ Failed to save campaign: {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -1029,12 +1143,14 @@ elif page == "🔍 Contact Discovery":
     if df.empty:
         st.info("No contacts yet. Run the Finder.")
     else:
-        _VERIFIED_STATUSES = ["PROSPEO_VERIFIED", "VALID", "PATTERN_ACCEPTED", "SMTP_VERIFIED", "WEB_SCRAPED", "APOLLO_VERIFIED"]
+        _VERIFIED_STATUSES = ["PROSPEO_VERIFIED", "FULLENRICH_VERIFIED", "VALID", "PATTERN_ACCEPTED", "SMTP_VERIFIED", "WEB_SCRAPED", "APOLLO_VERIFIED"]
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Total Contacts",  len(df))
         c2.metric("✅ Verified",     len(df[df["Verified"].isin(_VERIFIED_STATUSES)]))
         c3.metric("❌ No Email",     len(df[df["Email"] == ""]))
-        c4.metric("📫 Catch-All",   len(df[df["Verified"]=="PROSPEO_CATCH_ALL"]) if "PROSPEO_CATCH_ALL" in df["Verified"].values else 0)
+        
+        catch_all_count = len(df[df["Verified"].isin(["PROSPEO_CATCH_ALL", "FULLENRICH_CATCH_ALL"])]) if "Verified" in df.columns else 0
+        c4.metric("📫 Catch-All", catch_all_count)
 
         st.divider()
 
@@ -1689,7 +1805,7 @@ elif page == "📬 Mailboxes":
 elif page == "⚙️ Settings":
     st.title("Settings")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🧠 LLM Provider", "🎯 Scoring", "🔗 Sources", "⏰ Schedule"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🧠 LLM Provider", "🎯 Scoring", "🔗 Sources", "⏰ Schedule", "⚠️ Danger Zone"])
 
     with tab1:
         from openrouter_client import get_provider_info
@@ -1754,6 +1870,61 @@ elif page == "⚙️ Settings":
             {"Module":"sender",       "Interval":"Every 1 hour", "Description":"SMTP/Gmail API sending"},
             {"Module":"reply_checker","Interval":"Every 30 min", "Description":"IMAP inbox monitoring"},
         ]), use_container_width=True, hide_index=True)
+
+    with tab5:
+        st.error("⚠️ **Warning: Destructive Actions**")
+        st.markdown(
+            "These actions will permanently delete data from the database. "
+            "They are primarily meant for development and testing."
+        )
+
+        st.subheader("Reset Pipeline Data")
+        st.write("Wipes all leads, signals, contacts, emails, and events. **Preserves campaigns, mailboxes, and settings.**")
+        
+        reset_confirm = st.text_input("Type 'RESET' to confirm pipeline data reset")
+        if st.button("🗑️ Reset Pipeline Data", type="primary", disabled=reset_confirm != "RESET"):
+            from database import engine, get_session
+            from models import Company, Signal, Contact, Research, Email, ReplyLog, MessageEvent, SuppressionList
+            
+            with get_session() as s:
+                s.query(MessageEvent).delete()
+                s.query(ReplyLog).delete()
+                s.query(Email).delete()
+                s.query(Research).delete()
+                s.query(Contact).delete()
+                s.query(Signal).delete()
+                s.query(Company).delete()
+                s.query(SuppressionList).delete()
+                s.commit()
+            
+            st.success("Pipeline data successfully reset! Campaigns and Mailboxes have been preserved.")
+            st.cache_data.clear()
+            time.sleep(2)
+            st.rerun()
+
+        st.divider()
+
+        st.subheader("Full Database Factory Reset")
+        st.write("Drops and recreates all tables. **Everything will be lost.**")
+        
+        factory_confirm = st.text_input("Type 'FACTORY_RESET' to confirm full database destruction")
+        if st.button("🔥 Full Factory Reset", type="primary", disabled=factory_confirm != "FACTORY_RESET"):
+            from database import engine, init_db
+            import os
+            from config import DB_PATH
+            
+            # The most bulletproof way to reset SQLite is to delete the file
+            engine.dispose()
+            try:
+                if os.path.exists(DB_PATH):
+                    os.remove(DB_PATH)
+                init_db()
+                st.success("Database fully factory reset!")
+                st.cache_data.clear()
+                time.sleep(2)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to delete database file. Is it locked? Error: {e}")
 
     st.divider()
     if st.button("🔄 Refresh Cache"):

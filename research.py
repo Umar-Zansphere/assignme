@@ -79,13 +79,25 @@ Respond with ONLY a JSON object containing:
 """
 
 
-def run(dry_run: bool = False):
+def run(dry_run: bool = False, target_campaign_id: int | None = None):
     """Research all companies with status EMAIL_VERIFIED."""
     init_db()
     log.info("Starting research agent...")
 
     with get_session() as session:
-        companies = session.query(Company).filter_by(status="EMAIL_VERIFIED").all()
+        # Only research companies from active campaigns
+        from utils import get_active_campaign_ids
+        active_ids = get_active_campaign_ids(session)
+        if target_campaign_id:
+            if target_campaign_id not in active_ids:
+                log.info(f"Campaign {target_campaign_id} is not active. Skipping.")
+                return
+            active_ids = [target_campaign_id]
+        
+        companies = session.query(Company).filter(
+            Company.status == "EMAIL_VERIFIED",
+            Company.campaign_id.in_(active_ids)
+        ).all()
         company_ids = [c.id for c in companies]
         log.info(f"Found {len(companies)} companies to research")
 
@@ -221,8 +233,13 @@ Detected signals:
 
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
+    target_campaign_id = None
+    for arg in sys.argv:
+        if arg.startswith("--campaign-id="):
+            target_campaign_id = int(arg.split("=")[1])
+            
     try:
-        run(dry_run=dry_run)
+        run(dry_run=dry_run, target_campaign_id=target_campaign_id)
     except Exception as e:
         log.error(f"Research agent failed: {e}", exc_info=True)
         sys.exit(1)

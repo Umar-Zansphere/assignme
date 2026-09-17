@@ -134,12 +134,14 @@ BOUNCE_RATE_CRITICAL: float = float(os.getenv("BOUNCE_RATE_CRITICAL", "0.10"))  
 
 # ── Database ───────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-raw_db_url = os.getenv("DATABASE_URL", "sqlite:///sales_machine.db")
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///sales_machine_v2.db")
 if raw_db_url.startswith("sqlite:///") and not os.path.isabs(raw_db_url.replace("sqlite:///", "")):
     db_filename = raw_db_url.replace("sqlite:///", "")
-    DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, db_filename).replace(os.sep, '/')}"
+    DB_PATH = os.path.join(BASE_DIR, db_filename)
+    DATABASE_URL = f"sqlite:///{DB_PATH.replace(os.sep, '/')}"
 else:
     DATABASE_URL = raw_db_url
+    DB_PATH = raw_db_url.replace("sqlite:///", "")
 
 # ── ICP Scoring ────────────────────────────────────────────
 ICP_SCORE_THRESHOLD: int = int(os.getenv("ICP_SCORE_THRESHOLD", "60"))

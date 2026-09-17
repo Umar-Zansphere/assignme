@@ -22,7 +22,7 @@ from utils import get_logger, utcnow
 log = get_logger("sender")
 
 
-def run(dry_run: bool = False):
+def run(dry_run: bool = False, target_campaign_id: int | None = None):
     """Send all scheduled emails that are due."""
     init_db()
     log.info("Starting email sender...")
@@ -30,12 +30,22 @@ def run(dry_run: bool = False):
     now = utcnow()
 
     with get_session() as session:
-        # Get emails that are scheduled and due
+        # Only send emails from active campaigns
+        from utils import get_active_campaign_ids
+        active_ids = get_active_campaign_ids(session)
+        if target_campaign_id:
+            if target_campaign_id not in active_ids:
+                log.info(f"Campaign {target_campaign_id} is not active. Skipping.")
+                return
+            active_ids = [target_campaign_id]
+        
+        # Get emails that are scheduled and due, belonging to active campaigns
         emails = (
             session.query(Email)
             .filter(
                 Email.status == "SCHEDULED",
                 Email.scheduled_at <= now,
+                Email.campaign_id.in_(active_ids),
             )
             .order_by(Email.scheduled_at)
             .all()
@@ -214,33 +224,37 @@ if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
 
     if "--test" in sys.argv:
-        # Parse: python sender.py --test email@example.com [--subject "..."] [--body "..."]
+        # Usage: python sender.py --test user@domain.com
         args = sys.argv[:]
-        test_idx = args.index("--test")
-        if test_idx + 1 >= len(args) or args[test_idx + 1].startswith("--"):
-            print("Usage: python sender.py --test <email> [--subject <text>] [--body <text>]")
+        args.remove("--test")
+        
+        # Remove any --campaign-id flag if it slipped into the test arguments
+        args = [arg for arg in args if not arg.startswith("--campaign-id=")]
+        
+        if len(args) < 2:
+            print("Error: must provide an email address. Example: python sender.py --test me@example.com")
             sys.exit(1)
-        to_email = args[test_idx + 1]
-
-        subject = None
-        body = None
+        
+        to_email = args[1]
+        
+        # Basic parsing for optional subject/body (very rudimentary)
+        subject, body = None, None
         if "--subject" in args:
-            si = args.index("--subject")
-            if si + 1 < len(args):
-                subject = args[si + 1]
+            idx = args.index("--subject")
+            if idx + 1 < len(args): subject = args[idx + 1]
         if "--body" in args:
-            bi = args.index("--body")
-            if bi + 1 < len(args):
-                body = args[bi + 1]
-
-        try:
-            send_test(to_email, subject=subject, body=body)
-        except Exception as e:
-            log.error(f"Test send failed: {e}", exc_info=True)
-            sys.exit(1)
+            idx = args.index("--body")
+            if idx + 1 < len(args): body = args[idx + 1]
+            
+        send_test(to_email, subject, body)
     else:
+        target_campaign_id = None
+        for arg in sys.argv:
+            if arg.startswith("--campaign-id="):
+                target_campaign_id = int(arg.split("=")[1])
+                
         try:
-            run(dry_run=dry_run)
+            run(dry_run=dry_run, target_campaign_id=target_campaign_id)
         except Exception as e:
             log.error(f"Sender failed: {e}", exc_info=True)
             sys.exit(1)

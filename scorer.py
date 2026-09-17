@@ -228,19 +228,32 @@ def calculate_score_legacy(company: Company, signals: list[Signal]) -> tuple[int
     return score, reasons
 
 
-def run(dry_run: bool = False, rescore: bool = False):
+def run(dry_run: bool = False, rescore: bool = False, target_campaign_id: int | None = None):
     """Score companies using campaign rules or legacy fallback."""
     init_db()
     mode = "RESCORE ALL" if rescore else "new ENRICHED companies"
     log.info(f"Starting ICP scoring ({mode})...")
 
     with get_session() as session:
+        # Get active campaign IDs
+        from utils import get_active_campaign_ids
+        active_ids = get_active_campaign_ids(session)
+        if target_campaign_id:
+            if target_campaign_id not in active_ids:
+                log.info(f"Campaign {target_campaign_id} is not active. Skipping.")
+                return
+            active_ids = [target_campaign_id]
+        
         if rescore:
             companies = session.query(Company).filter(
-                Company.status.notin_(["NEW_SIGNAL", "REJECTED"])
+                Company.status.notin_(["NEW_SIGNAL", "REJECTED"]),
+                Company.campaign_id.in_(active_ids)
             ).all()
         else:
-            companies = session.query(Company).filter_by(status="ENRICHED").all()
+            companies = session.query(Company).filter(
+                Company.status == "ENRICHED",
+                Company.campaign_id.in_(active_ids)
+            ).all()
 
         log.info(f"Found {len(companies)} companies to score")
 
@@ -288,8 +301,13 @@ def run(dry_run: bool = False, rescore: bool = False):
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
     rescore = "--rescore" in sys.argv
+    target_campaign_id = None
+    for arg in sys.argv:
+        if arg.startswith("--campaign-id="):
+            target_campaign_id = int(arg.split("=")[1])
+            
     try:
-        run(dry_run=dry_run, rescore=rescore)
+        run(dry_run=dry_run, rescore=rescore, target_campaign_id=target_campaign_id)
     except Exception as e:
         log.error(f"Scorer failed: {e}", exc_info=True)
         sys.exit(1)

@@ -27,6 +27,8 @@ from debug_contact import ensure_debug_contact, inject_debug_contact_for_all_cam
 
 log = get_logger("email_writer")
 
+DEBUG_MODE = False
+
 # Default prompt (no campaign)
 EMAIL_PROMPT_DEFAULT = """You are an elite B2B cold email copywriter.
 
@@ -99,14 +101,13 @@ def _get_or_create_campaign(session) -> Campaign:
     return campaign
 
 
-def run(dry_run: bool = False):
-    """Generate emails for all companies with status RESEARCH_DONE."""
+def run(dry_run: bool = False, target_campaign_id: int | None = None):
+    """Generate 3-step email sequences for RESEARCH_DONE companies."""
     init_db()
-    log.info("Starting email writer...")
+    log.info("Starting email writer agent...")
 
-    # Inject debug contact (umar.mohamed@zansphere.com) into all active campaigns
-    # so it always receives test emails regardless of pipeline state.
-    if not dry_run:
+    # For testing: If NO emails exist at all, inject our debug contact
+    if DEBUG_MODE:
         try:
             with get_session() as session:
                 inject_debug_contact_for_all_campaigns(session)
@@ -114,7 +115,19 @@ def run(dry_run: bool = False):
             log.warning(f"Debug contact injection failed (non-fatal): {e}")
 
     with get_session() as session:
-        companies = session.query(Company).filter_by(status="RESEARCH_DONE").all()
+        # Only write emails for companies from active campaigns
+        from utils import get_active_campaign_ids
+        active_ids = get_active_campaign_ids(session)
+        if target_campaign_id:
+            if target_campaign_id not in active_ids:
+                log.info(f"Campaign {target_campaign_id} is not active. Skipping.")
+                return
+            active_ids = [target_campaign_id]
+        
+        companies = session.query(Company).filter(
+            Company.status == "RESEARCH_DONE",
+            Company.campaign_id.in_(active_ids)
+        ).all()
         company_ids = [c.id for c in companies]
         log.info(f"Found {len(companies)} companies to write emails for")
 
@@ -154,7 +167,7 @@ def run(dry_run: bool = False):
 
             # Accept any contact that has a real email address
             _ACCEPTED_VERIFIED = [
-                "PROSPEO_VERIFIED", "VALID", "APIFY_VERIFIED", "APOLLO_VERIFIED",
+                "PROSPEO_VERIFIED", "FULLENRICH_VERIFIED", "VALID", "APIFY_VERIFIED", "APOLLO_VERIFIED",
                 "SMTP_VERIFIED", "WEB_SCRAPED", "PATTERN_ACCEPTED",
             ]
             contact = (
@@ -294,8 +307,13 @@ Signal that triggered outreach: {recent_news or f'Discovered via {company_signal
 
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
+    target_campaign_id = None
+    for arg in sys.argv:
+        if arg.startswith("--campaign-id="):
+            target_campaign_id = int(arg.split("=")[1])
+            
     try:
-        run(dry_run=dry_run)
+        run(dry_run=dry_run, target_campaign_id=target_campaign_id)
     except Exception as e:
         log.error(f"Email writer failed: {e}", exc_info=True)
         sys.exit(1)

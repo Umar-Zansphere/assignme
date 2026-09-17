@@ -94,7 +94,9 @@ def retry(max_attempts: int = 3, base_delay: float = 1.0, backoff: float = 2.0):
                         logger.error(
                             f"{func.__name__} failed after {max_attempts} attempts: {e}"
                         )
-            raise last_exception
+            if last_exception is not None:
+                raise last_exception
+            raise RuntimeError(f"Retry failed for {func.__name__}")
         return wrapper
     return decorator
 
@@ -184,3 +186,18 @@ def guess_email(first_name: str, last_name: str, domain: str) -> list[str]:
 def utcnow() -> datetime:
     """Return timezone-aware UTC now."""
     return datetime.now(timezone.utc)
+
+
+def get_active_campaign_ids(session) -> list[int]:
+    """Return IDs of all active, non-deleted campaigns.
+
+    Used by pipeline stages to filter work to only active campaigns.
+    """
+    from models import Campaign
+    campaigns = (
+        session.query(Campaign.id)
+        .filter(Campaign.status == "ACTIVE")
+        .filter(Campaign.deleted_at.is_(None))
+        .all()
+    )
+    return [c.id for c in campaigns]

@@ -38,6 +38,7 @@ log = get_logger("verifier")
 # Statuses from Prospeo that are already verified — skip re-verification
 _ALREADY_VERIFIED = {
     "PROSPEO_VERIFIED", "PROSPEO_CATCH_ALL",
+    "FULLENRICH_VERIFIED", "FULLENRICH_CATCH_ALL",
     "APIFY_VERIFIED", "SMTP_VERIFIED", "WEB_SCRAPED",
 }
 # All statuses that can proceed to email writing
@@ -99,17 +100,28 @@ def verify_contact(email: str) -> str:
     return "PATTERN_ACCEPTED"
 
 
-def run(dry_run: bool = False):
+def run(dry_run: bool = False, target_campaign_id: int | None = None):
     """Verify all unverified contacts using tiered trust model."""
     init_db()
     log.info("Starting email verification (Prospeo trust model)...")
 
     with get_session() as session:
+        # Only verify contacts from active campaigns
+        from utils import get_active_campaign_ids
+        active_ids = get_active_campaign_ids(session)
+        if target_campaign_id:
+            if target_campaign_id not in active_ids:
+                log.info(f"Campaign {target_campaign_id} is not active. Skipping.")
+                return
+            active_ids = [target_campaign_id]
+        
         # Skip contacts already verified by a high-confidence source
-        contacts = session.query(Contact).filter(
-            Contact.verified.notin_(list(_ALREADY_VERIFIED)),
+        contacts = session.query(Contact).join(
+            Company, Contact.company_id == Company.id
         ).filter(
+            Contact.verified.notin_(list(_ALREADY_VERIFIED)),
             Contact.email.isnot(None),
+            Company.campaign_id.in_(active_ids),
         ).all()
 
         pre_verified = session.query(Contact).filter(
@@ -191,8 +203,13 @@ def run(dry_run: bool = False):
 
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
+    target_campaign_id = None
+    for arg in sys.argv:
+        if arg.startswith("--campaign-id="):
+            target_campaign_id = int(arg.split("=")[1])
+            
     try:
-        run(dry_run=dry_run)
+        run(dry_run=dry_run, target_campaign_id=target_campaign_id)
     except Exception as e:
         log.error(f"Verifier failed: {e}", exc_info=True)
         sys.exit(1)

@@ -226,6 +226,88 @@ def create_campaign_from_config(session, config: dict, brief: str):
     return campaign
 
 
+def update_campaign_from_config(session, campaign_id: int, config: dict):
+    """
+    Update an existing Campaign record from an edited config dict.
+
+    Args:
+        session: SQLAlchemy session
+        campaign_id: ID of the campaign to update
+        config: dict with campaign configuration fields
+
+    Returns:
+        Updated Campaign ORM object, or None if not found
+    """
+    from models import Campaign
+
+    campaign = session.query(Campaign).filter_by(id=campaign_id).first()
+    if not campaign:
+        log.warning(f"Campaign {campaign_id} not found for update")
+        return None
+
+    # Update all editable fields
+    field_map = {
+        "name": "name",
+        "target_industries": ("target_industries", True),
+        "target_geography": ("target_geography", True),
+        "target_company_size": "target_company_size",
+        "target_roles": ("target_roles", True),
+        "target_verified_emails": "target_verified_emails",
+        "search_queries": ("search_queries", True),
+        "source_selection": ("source_selection", True),
+        "scoring_rules": ("scoring_rules", True),
+        "scoring_threshold": "scoring_threshold",
+        "exclusion_list": ("exclusion_list", True),
+        "our_offering": "our_offering",
+        "value_proposition": "value_proposition",
+        "pitch_angle": "pitch_angle",
+        "research_questions": ("research_questions", True),
+    }
+
+    for config_key, mapping in field_map.items():
+        if config_key not in config:
+            continue
+        if isinstance(mapping, tuple):
+            db_field, needs_json = mapping
+            setattr(campaign, db_field, safe_json_dumps(config[config_key]))
+        else:
+            setattr(campaign, mapping, config[config_key])
+
+    # Update brief if provided
+    if "brief" in config:
+        campaign.brief = config["brief"]
+
+    log.info(f"Campaign updated: id={campaign.id}, name='{campaign.name}'")
+    return campaign
+
+
+def soft_delete_campaign(session, campaign_id: int):
+    """
+    Soft-delete a campaign by setting deleted_at and status=ARCHIVED.
+    Does NOT cascade-delete associated data.
+
+    Args:
+        session: SQLAlchemy session
+        campaign_id: ID of the campaign to delete
+
+    Returns:
+        True if deleted, False if not found
+    """
+    from models import Campaign
+    from utils import utcnow
+
+    campaign = session.query(Campaign).filter_by(id=campaign_id).first()
+    if not campaign:
+        log.warning(f"Campaign {campaign_id} not found for deletion")
+        return False
+
+    campaign.status = "ARCHIVED"
+    campaign.is_active = 0
+    campaign.deleted_at = utcnow()
+    log.info(f"Campaign soft-deleted: id={campaign.id}, name='{campaign.name}'")
+    return True
+
+
 if __name__ == "__main__":
     # Quick test
     brief = """

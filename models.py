@@ -34,7 +34,7 @@ class Company(Base):
     __tablename__ = "companies"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String, nullable=False, unique=True)
+    name = Column(String, nullable=False)
     website = Column(String)
     industry = Column(String)
     country = Column(String)
@@ -81,6 +81,10 @@ class Company(Base):
     research = relationship("Research", back_populates="company", uselist=False, cascade="all, delete-orphan")
     emails = relationship("Email", back_populates="company", cascade="all, delete-orphan")
     reply_logs = relationship("ReplyLog", back_populates="company", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("name", "campaign_id", name="uq_company_campaign"),
+    )
 
     def __repr__(self):
         return f"<Company(id={self.id}, name='{self.name}', status='{self.status}')>"
@@ -171,7 +175,8 @@ class Campaign(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
-    is_active = Column(Integer, default=1)
+    status = Column(String, default="ACTIVE")  # ACTIVE, PAUSED, COMPLETED, ARCHIVED
+    is_active = Column(Integer, default=1)      # Legacy compat — derived from status
 
     # Stage 0 input
     brief = Column(Text)                       # Original natural language input from user
@@ -181,6 +186,9 @@ class Campaign(Base):
     target_geography = Column(Text)            # JSON list: ["India", "USA"]
     target_company_size = Column(String)        # e.g. "1-200"
     target_roles = Column(Text)                # JSON list: ["Founder", "CTO", "Owner"]
+
+    # Pipeline caps
+    target_verified_emails = Column(Integer)    # Stop finding contacts once N verified emails reached (null=unlimited)
 
     # Data source config (LLM-generated)
     search_queries = Column(Text)              # JSON dict: {"google_maps": ["..."], "apollo": ["..."], ...}
@@ -197,6 +205,9 @@ class Campaign(Base):
     pitch_angle = Column(Text)                 # How to frame the outreach
     research_questions = Column(Text)          # JSON list: ["What dashboard do they use?", ...]
 
+    # Soft delete
+    deleted_at = Column(DateTime)              # Null = active, timestamp = soft-deleted
+
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -205,7 +216,7 @@ class Campaign(Base):
     emails = relationship("Email", back_populates="campaign")
 
     def __repr__(self):
-        return f"<Campaign(id={self.id}, name='{self.name}', active={self.is_active})>"
+        return f"<Campaign(id={self.id}, name='{self.name}', status='{self.status}')>"
 
 
 # ── Emails ────────────────────────────────────────────────

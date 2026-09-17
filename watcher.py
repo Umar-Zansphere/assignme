@@ -23,6 +23,9 @@ import json
 from database import get_session, init_db
 from models import Company, Signal, Contact, Campaign
 from utils import get_logger, safe_json_loads, safe_json_dumps
+from source_normalizer import normalize_batch
+from apify_client import run_actor
+
 log = get_logger("watcher")
 
 # Legal suffixes to strip for deduplication
@@ -130,9 +133,9 @@ def _run_google_maps(queries: list[str], campaign: Campaign) -> list[dict]:
             else:
                 log.debug(f"  Filtered out '{r.get('name')}' — country '{r_country}' not in {geography}")
         log.info(f"  Geography filter: {len(results)} → {len(filtered)} results")
-        return filtered
+        return normalize_batch(filtered, "google_maps")
 
-    return results
+    return normalize_batch(results, "google_maps")
 
 
 def _run_apollo(queries: list[str], campaign: Campaign) -> list[dict]:
@@ -158,7 +161,7 @@ def _run_apollo(queries: list[str], campaign: Campaign) -> list[dict]:
         )
         all_results.extend(results)
 
-    return all_results
+    return normalize_batch(all_results, "apollo")
 
 
 def _run_searxng(queries: list[str]) -> list[dict]:
@@ -209,7 +212,7 @@ Respond with ONLY the JSON array.""",
                     all_results.append(item)
 
     log.info(f"SearXNG extracted {len(all_results)} companies")
-    return all_results
+    return normalize_batch(all_results, "searxng")
 
 
 def _run_linkedin(queries: list[str]) -> list[dict]:
@@ -250,7 +253,118 @@ def _run_linkedin(queries: list[str]) -> list[dict]:
         })
 
     log.info(f"LinkedIn returned {len(results)} companies")
-    return results
+    return normalize_batch(results, "linkedin")
+
+
+def _run_clutch(queries: list[str]) -> list[dict]:
+    """Run Clutch.co scraper via Apify."""
+    log.info(f"Running Clutch source...")
+    all_results = []
+    for query in queries:
+        try:
+            raw = run_actor("epctex/clutchco-scraper", {
+                "search": query,
+                "maxItems": 20,
+            })
+            all_results.extend(raw)
+        except Exception as e:
+            log.error(f"  Clutch scraper failed for '{query}': {e}")
+    return normalize_batch(all_results, "clutch")
+
+
+def _run_yelp(queries: list[str], campaign: Campaign) -> list[dict]:
+    """Run Yelp scraper via Apify."""
+    log.info(f"Running Yelp source...")
+    geography = safe_json_loads(campaign.target_geography) or []
+    location = geography[0] if geography else "USA"
+    
+    all_results = []
+    for query in queries:
+        try:
+            raw = run_actor("api-ninja/yelp-ultimate-scraper", {
+                "searchTerms": [query],
+                "locations": [location],
+                "limit": 20,
+            })
+            all_results.extend(raw)
+        except Exception as e:
+            log.error(f"  Yelp scraper failed for '{query}': {e}")
+    return normalize_batch(all_results, "yelp")
+
+
+def _run_indeed(queries: list[str], campaign: Campaign) -> list[dict]:
+    """Run Indeed scraper via Apify."""
+    log.info(f"Running Indeed source...")
+    geography = safe_json_loads(campaign.target_geography) or []
+    location = geography[0] if geography else "USA"
+    
+    all_results = []
+    for query in queries:
+        try:
+            raw = run_actor("kaix/indeed-scraper", {
+                "position": query,
+                "location": location,
+                "maxItemsPerSearch": 20,
+            })
+            all_results.extend(raw)
+        except Exception as e:
+            log.error(f"  Indeed scraper failed for '{query}': {e}")
+    return normalize_batch(all_results, "indeed")
+
+
+def _run_upwork(queries: list[str]) -> list[dict]:
+    """Run Upwork job scraper via Apify."""
+    log.info(f"Running Upwork source...")
+    all_results = []
+    for query in queries:
+        try:
+            raw = run_actor("neatrat/upwork-job-scraper", {
+                "keyword": query,
+                "maxItems": 20,
+            })
+            all_results.extend(raw)
+        except Exception as e:
+            log.error(f"  Upwork scraper failed for '{query}': {e}")
+            
+    # The normalizer will extract client details into _contact_name.
+    # We can use that later in the pipeline to find the actual company via LinkedIn.
+    return normalize_batch(all_results, "upwork")
+
+
+def _run_crunchbase(queries: list[str]) -> list[dict]:
+    """Run Crunchbase scraper via Apify."""
+    log.info(f"Running Crunchbase source...")
+    all_results = []
+    for query in queries:
+        try:
+            raw = run_actor("curious_coder/crunchbase-scraper", {
+                "queries": [query],
+                "maxResults": 20,
+            })
+            all_results.extend(raw)
+        except Exception as e:
+            log.error(f"  Crunchbase scraper failed for '{query}': {e}")
+    return normalize_batch(all_results, "crunchbase")
+
+
+def _run_yellowpages(queries: list[str], campaign: Campaign) -> list[dict]:
+    """Run YellowPages scraper via Apify."""
+    log.info(f"Running YellowPages source...")
+    geography = safe_json_loads(campaign.target_geography) or []
+    location = geography[0] if geography else "New York, NY"
+    
+    all_results = []
+    for query in queries:
+        try:
+            raw = run_actor("delicious_zebu/yellowpages-usa-business-lead-scraper", {
+                "searchTerms": [query],
+                "locations": [location],
+                "maxItems": 20,
+            })
+            all_results.extend(raw)
+        except Exception as e:
+            log.error(f"  YellowPages scraper failed for '{query}': {e}")
+    return normalize_batch(all_results, "yellowpages")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -292,8 +406,45 @@ def run_campaign(campaign: Campaign, dry_run: bool = False):
 
     if "linkedin" in source_selection:
         queries = search_queries.get("linkedin", [])
-        results = _run_linkedin(queries)
-        all_results.extend(results)
+        if queries:
+            results = _run_linkedin(queries)
+            all_results.extend(results)
+
+    if "clutch" in source_selection:
+        queries = search_queries.get("clutch", [])
+        if queries:
+            results = _run_clutch(queries)
+            all_results.extend(results)
+
+    if "yelp" in source_selection:
+        queries = search_queries.get("yelp", [])
+        if queries:
+            results = _run_yelp(queries, campaign)
+            all_results.extend(results)
+
+    if "indeed" in source_selection:
+        queries = search_queries.get("indeed", [])
+        if queries:
+            results = _run_indeed(queries, campaign)
+            all_results.extend(results)
+
+    if "upwork" in source_selection:
+        queries = search_queries.get("upwork", [])
+        if queries:
+            results = _run_upwork(queries)
+            all_results.extend(results)
+
+    if "crunchbase" in source_selection:
+        queries = search_queries.get("crunchbase", [])
+        if queries:
+            results = _run_crunchbase(queries)
+            all_results.extend(results)
+
+    if "yellowpages" in source_selection:
+        queries = search_queries.get("yellowpages", [])
+        if queries:
+            results = _run_yellowpages(queries, campaign)
+            all_results.extend(results)
 
     if not all_results:
         log.info("No results from any source. Exiting.")
@@ -357,11 +508,14 @@ def _store_results(all_results: list[dict], campaign: Campaign):
                     if val and not merged[key]:
                         merged[key] = val
 
-            # Find or create company
-            company = session.query(Company).filter_by(name=company_name).first()
+            # Find or create company (scoped to this campaign)
+            company = session.query(Company).filter_by(
+                name=company_name, campaign_id=campaign.id
+            ).first()
             if not company:
                 company = next(
-                    (obj for obj in session.new if isinstance(obj, Company) and obj.name == company_name),
+                    (obj for obj in session.new if isinstance(obj, Company)
+                     and obj.name == company_name and obj.campaign_id == campaign.id),
                     None,
                 )
 
@@ -384,7 +538,7 @@ def _store_results(all_results: list[dict], campaign: Campaign):
                 )
 
                 # Determine contact channel based on available data
-                has_email = any(r.get("email") for r in results)
+                has_email = any(r.get("_contact_email") for r in results)
                 has_phone = bool(merged["phone"])
                 if has_email:
                     company.contact_channel = "EMAIL"
@@ -435,9 +589,9 @@ def _store_results(all_results: list[dict], campaign: Campaign):
                     session.add(signal)
                     new_signals += 1
 
-            # Create contacts from source data (Apollo contacts, LinkedIn job posters)
+            # Create contacts from source data
             for r in results:
-                contact_name = r.get("contact_name") or r.get("_poster_name", "")
+                contact_name = r.get("_contact_name", "")
                 if contact_name and len(contact_name.split()) >= 2:
                     existing_contact = session.query(Contact).filter_by(
                         company_id=company.id, name=contact_name
@@ -446,9 +600,9 @@ def _store_results(all_results: list[dict], campaign: Campaign):
                         contact = Contact(
                             company_id=company.id,
                             name=contact_name,
-                            role=r.get("role") or r.get("_poster_title", ""),
-                            email=r.get("email", ""),
-                            linkedin_url=r.get("linkedin_url") or r.get("_poster_profile", ""),
+                            role=r.get("_contact_role", ""),
+                            email=r.get("_contact_email", ""),
+                            linkedin_url=r.get("_contact_linkedin", ""),
                             email_source=r.get("source", ""),
                             verified=r.get("verified"),
                         )
@@ -471,7 +625,10 @@ def run(dry_run: bool = False, campaign_id: int | None = None):
         if campaign_id:
             campaigns = session.query(Campaign).filter_by(id=campaign_id).all()
         else:
-            campaigns = session.query(Campaign).filter_by(is_active=1).all()
+            campaigns = session.query(Campaign).filter(
+                Campaign.status == "ACTIVE",
+                Campaign.deleted_at.is_(None)
+            ).all()
 
         if not campaigns:
             log.warning("No active campaigns found. Create a campaign first via the dashboard.")

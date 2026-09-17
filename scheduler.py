@@ -27,39 +27,67 @@ PYTHON = sys.executable
 
 
 def run_module(module_name: str):
-    """Run a pipeline module as a subprocess."""
+    """Run a pipeline module as a subprocess. Spawns per active campaign if applicable."""
     script_path = os.path.join(BASE_DIR, f"{module_name}.py")
 
     if not os.path.exists(script_path):
         log.error(f"Module not found: {script_path}")
         return
 
-    log.info(f">> Running {module_name}...")
-    try:
-        result = subprocess.run(
-            [PYTHON, script_path],
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout per module
-            cwd=BASE_DIR,
-        )
+    # reply_checker is a global module (it monitors mailboxes for all campaigns)
+    is_global_module = (module_name == "reply_checker")
 
-        if result.stdout:
-            for line in result.stdout.strip().split("\n"):
-                log.info(f"  [{module_name}] {line}")
+    if is_global_module:
+        campaign_ids = [None]
+    else:
+        try:
+            from database import get_session
+            from utils import get_active_campaign_ids
+            with get_session() as session:
+                campaign_ids = get_active_campaign_ids(session)
+        except Exception as e:
+            log.error(f"Failed to fetch active campaigns for {module_name}: {e}")
+            return
+            
+        if not campaign_ids:
+            log.info(f">> Skipping {module_name} (no active campaigns)")
+            return
 
-        if result.returncode != 0:
-            log.error(f"  [{module_name}] exited with code {result.returncode}")
-            if result.stderr:
-                for line in result.stderr.strip().split("\n")[-5:]:
-                    log.error(f"  [{module_name}] {line}")
+    for cid in campaign_ids:
+        cmd = [PYTHON, script_path]
+        if cid is not None:
+            cmd.append(f"--campaign-id={cid}")
+            log_prefix = f"[{module_name} | Camp #{cid}]"
+            log.info(f">> Running {module_name} for Campaign #{cid}...")
         else:
-            log.info(f"[OK] {module_name} completed successfully")
+            log_prefix = f"[{module_name}]"
+            log.info(f">> Running {module_name} (global)...")
 
-    except subprocess.TimeoutExpired:
-        log.error(f"  [{module_name}] timed out after 600s")
-    except Exception as e:
-        log.error(f"  [{module_name}] failed to run: {e}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,  # 10 minute timeout per module
+                cwd=BASE_DIR,
+            )
+
+            if result.stdout:
+                for line in result.stdout.strip().split("\n"):
+                    if line: log.info(f"  {log_prefix} {line}")
+
+            if result.returncode != 0:
+                log.error(f"  {log_prefix} exited with code {result.returncode}")
+                if result.stderr:
+                    for line in result.stderr.strip().split("\n")[-5:]:
+                        if line: log.error(f"  {log_prefix} {line}")
+            else:
+                log.info(f"[OK] {log_prefix} completed successfully")
+
+        except subprocess.TimeoutExpired:
+            log.error(f"  {log_prefix} timed out after 600s")
+        except Exception as e:
+            log.error(f"  {log_prefix} failed to run: {e}")
 
 
 # ── Schedule Configuration ─────────────────────────────────

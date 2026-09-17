@@ -260,13 +260,56 @@ def _strategy_d_search(session, company: Company, target_roles: list[str]) -> bo
     return True
 
 
-def run(dry_run: bool = False):
+def run(dry_run: bool = False, target_campaign_id: int | None = None):
     """Find decision makers for all qualified companies."""
     init_db()
     log.info("Starting decision maker finder...")
 
     with get_session() as session:
-        companies = session.query(Company).filter_by(status="QUALIFIED").all()
+        # Only process companies from active campaigns
+        from utils import get_active_campaign_ids
+        active_ids = get_active_campaign_ids(session)
+        if target_campaign_id:
+            if target_campaign_id not in active_ids:
+                log.info(f"Campaign {target_campaign_id} is not active. Skipping.")
+                return
+            active_ids = [target_campaign_id]
+        
+        companies = session.query(Company).filter(
+            Company.status == "QUALIFIED",
+            Company.campaign_id.in_(active_ids)
+        ).all()
+        
+        # Check target_verified_emails cap per campaign
+        from models import Campaign
+        campaign_caps = {}
+        for cid in active_ids:
+            camp = session.query(Campaign).filter_by(id=cid).first()
+            if camp and camp.target_verified_emails:
+                # Count verified contacts already found for this campaign
+                verified_count = (
+                    session.query(Contact)
+                    .join(Company, Contact.company_id == Company.id)
+                    .filter(
+                        Company.campaign_id == cid,
+                        Contact.email.isnot(None),
+                        Contact.email != "",
+                    )
+                    .count()
+                )
+                campaign_caps[cid] = (camp.target_verified_emails, verified_count)
+        
+        # Filter out companies whose campaign has already hit its cap
+        filtered = []
+        for c in companies:
+            if c.campaign_id in campaign_caps:
+                cap, current = campaign_caps[c.campaign_id]
+                if current >= cap:
+                    log.info(f"  Skipping {c.name}: campaign #{c.campaign_id} reached cap ({current}/{cap})")
+                    continue
+            filtered.append(c)
+        companies = filtered
+        
         company_ids = [c.id for c in companies]
         log.info(f"Found {len(companies)} companies to find contacts for")
 
@@ -316,8 +359,13 @@ def run(dry_run: bool = False):
 
 if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
+    target_campaign_id = None
+    for arg in sys.argv:
+        if arg.startswith("--campaign-id="):
+            target_campaign_id = int(arg.split("=")[1])
+            
     try:
-        run(dry_run=dry_run)
+        run(dry_run=dry_run, target_campaign_id=target_campaign_id)
     except Exception as e:
         log.error(f"Finder failed: {e}", exc_info=True)
         sys.exit(1)
