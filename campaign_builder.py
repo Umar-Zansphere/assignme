@@ -76,12 +76,9 @@ Respond with ONLY a JSON object containing ALL these keys:
     "searxng": ["web search query 1", "web search query 2", "web search query 3"]
   }},
   
-  "scoring_rules": [
-    {{"rule": "Description of positive signal", "weight": 30, "type": "keyword", "keywords": ["keyword1", "keyword2"]}},
-    {{"rule": "Description of negative signal", "weight": -50, "type": "keyword", "keywords": ["keyword1"]}}
-  ],
-  "scoring_threshold": 60,
-  "exclusion_list": ["Industry or type to exclude 1", "Industry 2"],
+  "scoring_rules": [...see rules section below...],
+  "scoring_threshold": <integer>,
+  "exclusion_list": ["keyword or phrase to hard-exclude 1", "..."],
   
   "our_offering": "What the sender's company provides (inferred from brief)",
   "value_proposition": "Why the target would care about this offering",
@@ -92,7 +89,9 @@ Respond with ONLY a JSON object containing ALL these keys:
   ]
 }}
 
-CRITICAL RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SOURCES (CRITICAL RULES)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - ONLY include sources marked ✅ AVAILABLE in source_selection. NEVER use ❌ sources.
 - google_maps is MANDATORY for every campaign. It is the primary company discovery tool.
 - searxng is MANDATORY for every campaign. It supplements google_maps with web data.
@@ -100,16 +99,67 @@ CRITICAL RULES:
 - Only add search_queries for sources you included in source_selection.
 - search_queries for google_maps should include the target geography in the query string (e.g., "EV startups India", not just "EV startups").
 
-For scoring_rules, "type" can be:
-- "keyword" — matches keywords against company name, industry, description
-- "size" — checks employee count range  
-- "geography" — checks company country
-- "signal" — checks what signal/source found the company
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCORING RULES (READ EVERY WORD)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-IMPORTANT for keyword rules: Include a MIX of single words AND short phrases.
-Single words like "ev", "battery", "solar" match more broadly.
-Phrases like "electric vehicle" are more precise but may miss partial matches.
-Always include the core single-word terms alongside any phrases.
+Rule types:
+- "keyword" — matches keywords against company name, industry, description
+- "size"    — checks employee count range (use fields: "min", "max")
+- "geography" — checks company country (use field: "countries", NOT "keywords")
+- "signal"  — checks what source found the company (use field: "sources")
+
+KEYWORD MATCHING — most important type:
+  Keyword rules match against: company name, industry, category, and AI description.
+  In early pipeline stages, most companies only have a NAME — no industry, no description.
+  Therefore: your positive keyword rules MUST include terms that appear in company NAMES,
+  not just terms that appear in websites or descriptions.
+  
+  Example ICP: pharma manufacturers
+  ✅ GOOD keywords: ["pharma", "pharmaceutical", "pharma pvt", "laboratories", "biotech"]
+     (these appear in company names like "Healing Pharma Pvt Ltd")
+  ❌ BAD keywords: ["digitize", "implementation", "digital transformation"]
+     (these only appear in website text — useless when companies have no description)
+
+NEGATIVE KEYWORD RULES — for disqualifying bad fits:
+  Use negative rules (weight < 0) to penalize company types that are clearly not your ICP.
+  Example: if targeting pharma manufacturers, penalize retail pharmacies and hospitals.
+  ✅ GOOD: {{"rule": "Retail pharmacy - not a B2B software buyer", "weight": -60, "type": "keyword", "keywords": ["pharmacy", "chemist", "drug store", "dispensary"]}}
+
+GEOGRAPHY RULES — STRICT RULES:
+  ⚠️  NEVER create a negative geography rule targeting the same country as target_geography.
+      If target_geography is ["India"], do NOT create a rule that penalizes "India".
+      This is contradictory and will disqualify all your leads.
+  ✅  If you want to give a bonus for being in the target geography, use a "geography" rule
+      with a POSITIVE weight and list the target countries in the "countries" field.
+  ✅  If you want to penalize companies OUTSIDE the target geography, do NOT create a
+      geography rule — the pipeline handles this automatically via the geography penalty.
+  ✅  ALWAYS use the field name "countries" (not "keywords") in geography rules.
+  Example: {{"rule": "Based in target market", "weight": 20, "type": "geography", "countries": ["India"]}}
+
+SIGNAL RULES:
+  Use signal rules to reward companies found via higher-quality sources.
+  Example: companies found via searxng or apollo tend to have more digital presence.
+  {{"rule": "Found via B2B database or web search", "weight": 15, "type": "signal", "sources": ["searxng", "apollo", "linkedin"]}}
+
+THRESHOLD CALIBRATION — CRITICAL:
+  scoring_threshold must be reachable by a typical target company.
+  Before setting the threshold, calculate the max score for a typical good lead:
+    max_score = (highest positive keyword rule weight) + (geography auto-bonus: +20) + (signal rule weight if applicable)
+  Then set scoring_threshold = max_score × 0.7  (round to nearest 5)
+  
+  Example: best keyword rule = +40, geography bonus = +20, signal rule = +15 → max = 75
+  Threshold = 75 × 0.7 ≈ 50  ✓
+  
+  ❌ NEVER set scoring_threshold higher than the sum of all positive rule weights + 20.
+     If you do, NO company will ever qualify.
+
+RULE DESIGN CHECKLIST (verify before responding):
+  □ At least one positive keyword rule uses words that appear in company NAMES
+  □ No negative geography rule targets a country in target_geography
+  □ All geography rules use "countries" field, not "keywords"
+  □ scoring_threshold ≤ (sum of positive rule weights + 20)
+  □ exclusion_list contains company TYPE keywords (e.g. "pharmacy"), not vague terms
 """
 
 

@@ -20,6 +20,10 @@ from utils import get_logger, utcnow, safe_json_loads
 
 log = get_logger("scorer")
 
+# Track which contradictory geography rules have already been warned about
+# so we don't spam the log with the same message for every company.
+_warned_geo_rules: set[str] = set()
+
 
 def _load_campaign_rules(session, company: Company) -> tuple[list[dict], int, list[str], list[str]]:
     """
@@ -133,7 +137,27 @@ def calculate_score_dynamic(
                 reasons.append(f"{rule_desc} (employees={emp}): {'+' if weight > 0 else ''}{weight}")
 
         elif rule_type == "geography":
-            target_countries = [c.lower() for c in rule.get("countries", [])]
+            # Support both 'countries' and 'keywords' — LLM sometimes emits the wrong field
+            target_countries = [c.lower() for c in (rule.get("countries") or rule.get("keywords") or [])]
+
+            # Guard against a common LLM mistake: generating a *negative* geography rule
+            # that penalises the very country the campaign is already targeting.
+            # The automatic geography bonus/penalty logic handles in/out-of-target regions,
+            # so a contradictory rule like "not in India" with target_geography=["India"]
+            # would unfairly reject all leads.  Skip it and warn.
+            if weight < 0 and target_geography:
+                geo_lower_set = {g.lower().strip() for g in target_geography}
+                contradictory = [c for c in target_countries if c in geo_lower_set]
+                if contradictory:
+                    if rule_desc not in _warned_geo_rules:
+                        _warned_geo_rules.add(rule_desc)
+                        log.warning(
+                            f"Skipping contradictory negative geography rule '{rule_desc}': "
+                            f"it penalises {contradictory} which is in target_geography {target_geography}. "
+                            f"The automatic geography logic already handles this."
+                        )
+                    continue
+
             if country_lower in target_countries:
                 score += weight
                 reasons.append(f"{rule_desc} (country={company.country}): {'+' if weight > 0 else ''}{weight}")
@@ -228,6 +252,37 @@ def calculate_score_legacy(company: Company, signals: list[Signal]) -> tuple[int
     return score, reasons
 
 
+def _calibrate_threshold(rules: list[dict], threshold: int, target_geography: list[str]) -> int:
+    """
+    Sanity-check the threshold against what the rules can realistically score.
+
+    If the threshold exceeds the maximum achievable positive score, clamp it to
+    80% of that max so companies can actually qualify. Logs a warning when this
+    happens so operators know the campaign rules may need tuning.
+
+    Note: Multi-source bonuses (+20/+40) are NOT included in the max because they
+    are rare (most companies come from a single source) and would make the
+    calibration too optimistic.
+    """
+    positive_rule_max = sum(r.get("weight", 0) for r in rules if r.get("weight", 0) > 0)
+    # Only count the geography bonus — it's reliable for in-target companies.
+    # Multi-source bonuses are excluded as they apply to very few companies.
+    auto_bonus = 20 if target_geography else 0
+    max_achievable = positive_rule_max + auto_bonus
+
+    if max_achievable > 0 and threshold > max_achievable:
+        calibrated = max(1, int(max_achievable * 0.8))
+        log.warning(
+            f"Threshold {threshold} exceeds max achievable score {max_achievable} "
+            f"(positive_rules={positive_rule_max} + geo_bonus={auto_bonus}). "
+            f"Auto-calibrating threshold to {calibrated} so companies can qualify. "
+            f"Consider lowering the campaign's scoring_threshold."
+        )
+        return calibrated
+    return threshold
+
+
+
 def run(dry_run: bool = False, rescore: bool = False, target_campaign_id: int | None = None):
     """Score companies using campaign rules or legacy fallback."""
     init_db()
@@ -245,8 +300,9 @@ def run(dry_run: bool = False, rescore: bool = False, target_campaign_id: int | 
             active_ids = [target_campaign_id]
         
         if rescore:
+            # Include REJECTED so a re-run can recover companies wrongly disqualified
             companies = session.query(Company).filter(
-                Company.status.notin_(["NEW_SIGNAL", "REJECTED"]),
+                Company.status.notin_(["NEW_SIGNAL"]),
                 Company.campaign_id.in_(active_ids)
             ).all()
         else:
@@ -260,6 +316,9 @@ def run(dry_run: bool = False, rescore: bool = False, target_campaign_id: int | 
         qualified = 0
         rejected = 0
 
+        # Cache calibrated thresholds per campaign to avoid recalculating per company
+        _calibrated_thresholds: dict[int | None, int] = {}
+
         for company in companies:
             signals = session.query(Signal).filter_by(company_id=company.id).all()
 
@@ -267,6 +326,12 @@ def run(dry_run: bool = False, rescore: bool = False, target_campaign_id: int | 
             rules, threshold, exclusions, geography = _load_campaign_rules(session, company)
 
             if rules:
+                # Calibrate threshold once per campaign
+                cid = company.campaign_id
+                if cid not in _calibrated_thresholds:
+                    _calibrated_thresholds[cid] = _calibrate_threshold(rules, threshold, geography)
+                threshold = _calibrated_thresholds[cid]
+
                 # Dynamic campaign-driven scoring
                 score, reasons = calculate_score_dynamic(company, signals, rules, exclusions, geography)
                 log.info(f"  {company.name}: score={score} (campaign threshold={threshold})")
@@ -288,7 +353,9 @@ def run(dry_run: bool = False, rescore: bool = False, target_campaign_id: int | 
             company.updated_at = utcnow()
 
             if score >= threshold:
-                if company.status == "ENRICHED":
+                # Allow ENRICHED and REJECTED companies to become QUALIFIED.
+                # Do not touch companies already in downstream states (EMAILED, REPLIED, etc.)
+                if company.status in ("ENRICHED", "REJECTED"):
                     company.status = "QUALIFIED"
                 qualified += 1
             else:

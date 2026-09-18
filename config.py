@@ -30,7 +30,7 @@ load_dotenv(override=True)
 #
 # Provider presets (base_url / default_model):
 _LLM_PRESETS: dict[str, dict] = {
-    "ollama":     {"base_url": "http://192.168.29.65:11434/v1",                              "model": "qwen3:14b"},
+    "ollama":     {"base_url": "http://localhost:11434/v1",                              "model": "qwen3:14b"},
     "groq":       {"base_url": "https://api.groq.com/openai/v1",                        "model": "qwen/qwen3.6-27b"},
     "openrouter": {"base_url": "https://openrouter.ai/api/v1",                          "model": "meta-llama/llama-3.3-70b-instruct"},
     "openai":     {"base_url": "https://api.openai.com/v1",                             "model": "gpt-4o-mini"},
@@ -61,7 +61,7 @@ LLM_FAST_MODEL: str = os.getenv("LLM_FAST_MODEL", "")
 SEARCH_PROVIDERS: str = os.getenv("SEARCH_PROVIDERS", "searxng,serper,apify")
 
 # SearXNG — self-hosted metasearch (free)
-SEARXNG_URL: str = os.getenv("SEARXNG_URL", "http://192.168.29.65:8080")
+SEARXNG_URL: str = os.getenv("SEARXNG_URL", "http://localhost:8080")
 
 # Serper.dev — $0.001/query, very reliable (get key at serper.dev)
 SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "")

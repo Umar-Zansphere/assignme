@@ -8,7 +8,7 @@ Providers (tried in order until one succeeds):
 
 Configuration in .env:
   SEARCH_PROVIDERS=searxng,serper,apify   # order defines priority
-  SEARXNG_URL=http://192.168.29.65:8080
+  SEARXNG_URL=http://localhost:8080
   SERPER_API_KEY=<your_key>
   APIFY_API_TOKEN=<your_token>            # already used for LinkedIn
 
